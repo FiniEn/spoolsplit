@@ -18,10 +18,13 @@ export async function POST(request: Request) {
 
     const parts: any[] = [
       {
-        text: `You are an expert 3D printing invoice parser. Extract all filament spools/refills from this receipt.
-        Proportionally distribute any tax, shipping, and discounts across each spool so 'unit_landed_cost' reflects the true out-of-pocket cost per single spool.
-        If a line item has quantity > 1, return the 'unit_landed_cost' for ONE spool and set 'quantity' accordingly.
-        Estimate a 6-character hex code (e.g. #FFFFFF) for 'estimated_color_hex' based on the filament color name.`,
+        text: `You are an expert 3D printing invoice parser. Extract every item from this receipt into two lists:
+        - 'spools': filament spools/refills.
+        - 'parts': everything else bought for the printer — nozzles, hotends, PTFE tubes, build plates, AMS parts, and maintenance items (lubricant, cleaning, desiccant, etc.). Use category 'other' if unsure. Do NOT list tax, shipping, discounts or gift cards as parts.
+        Proportionally distribute any tax, shipping, and discounts across ALL items (spools and parts) so 'unit_landed_cost' reflects the true out-of-pocket cost of ONE unit.
+        If a line item has quantity > 1, return the 'unit_landed_cost' for ONE unit and set 'quantity' accordingly.
+        For spools, estimate a 6-character hex code (e.g. #FFFFFF) for 'estimated_color_hex' based on the filament color name.
+        Either list may be empty.`,
       },
     ];
 
@@ -46,6 +49,7 @@ export async function POST(request: Request) {
           type: Type.OBJECT,
           properties: {
             vendor: { type: Type.STRING },
+            order_date: { type: Type.STRING, description: 'Order/invoice date as YYYY-MM-DD, empty if not shown' },
             grand_total: { type: Type.NUMBER },
             spools: {
               type: Type.ARRAY,
@@ -71,8 +75,24 @@ export async function POST(request: Request) {
                 ],
               },
             },
+            parts: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  name: { type: Type.STRING },
+                  category: {
+                    type: Type.STRING,
+                    enum: ['nozzle', 'hotend', 'ptfe_tube', 'build_plate', 'ams_part', 'maintenance', 'other'],
+                  },
+                  quantity: { type: Type.INTEGER },
+                  unit_landed_cost: { type: Type.NUMBER },
+                },
+                required: ['name', 'category', 'quantity', 'unit_landed_cost'],
+              },
+            },
           },
-          required: ['vendor', 'spools', 'grand_total'],
+          required: ['vendor', 'spools', 'parts', 'grand_total'],
         },
       },
     });

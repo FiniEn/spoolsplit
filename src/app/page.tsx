@@ -1,7 +1,21 @@
 'use client';
 
 import React, { useEffect, useState, useMemo } from 'react';
-import { supabase, supabaseConfigured, missingSupabaseVars, User, PrintSpoolUsage, Spool, PrintJob, Settlement } from '@/lib/supabase';
+import {
+  supabase,
+  supabaseConfigured,
+  missingSupabaseVars,
+  User,
+  PrintSpoolUsage,
+  Spool,
+  PrintJob,
+  Settlement,
+  Part,
+  PartCategory,
+  PART_CATEGORIES,
+  PART_CATEGORY_LABELS,
+} from '@/lib/supabase';
+import { formatMinutes, partShares, partsBalanceAOwesB, printMinutesByUser } from '@/lib/split';
 import {
   Disc,
   Printer,
@@ -15,6 +29,7 @@ import {
   Archive,
   X,
   HandCoins,
+  Wrench,
 } from 'lucide-react';
 
 type StagedSpool = {
@@ -26,7 +41,26 @@ type StagedSpool = {
   purchase_price: number | string;
 };
 
+type StagedPart = {
+  name: string;
+  category: PartCategory;
+  price: number | string;
+};
+
 type UsageDraft = { spool_id: string; grams_used: number };
+
+const newStagedPart = (overrides: Partial<StagedPart> = {}): StagedPart => ({
+  name: '',
+  category: 'nozzle',
+  price: '',
+  ...overrides,
+});
+
+/** Today's date as YYYY-MM-DD in the viewer's time zone. */
+const todayIso = () => {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+};
 
 const newStagedSpool = (overrides: Partial<StagedSpool> = {}): StagedSpool => ({
   brand: 'Bambu Lab',
@@ -72,6 +106,7 @@ export default function SpoolSplitApp() {
   const [allSpools, setAllSpools] = useState<Spool[]>([]);
   const [prints, setPrints] = useState<PrintJob[]>([]);
   const [settlements, setSettlements] = useState<Settlement[]>([]);
+  const [parts, setParts] = useState<Part[]>([]);
   const [splitMode, setSplitMode] = useState<'usage' | 'pool'>('usage');
   const [activeTab, setActiveTab] = useState<'prints' | 'spools' | 'settle'>('prints');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -86,13 +121,18 @@ export default function SpoolSplitApp() {
   const [receiptPaidBy, setReceiptPaidBy] = useState<string>('');
   const [receiptText, setReceiptText] = useState('');
   const [stagedSpools, setStagedSpools] = useState<StagedSpool[]>([]);
+  const [stagedParts, setStagedParts] = useState<StagedPart[]>([]);
+  const [receiptDate, setReceiptDate] = useState(todayIso());
 
   // Print Logger State
   const [printTitle, setPrintTitle] = useState('');
   const [printedBy, setPrintedBy] = useState<string>('');
   const [isSharedPrint, setIsSharedPrint] = useState(false);
-  const [printDuration, setPrintDuration] = useState<number>(60);
+  const [printHours, setPrintHours] = useState('');
+  const [printMins, setPrintMins] = useState('');
   const [printNoteOrUrl, setPrintNoteOrUrl] = useState('');
+  const [printSource, setPrintSource] = useState<'manual' | 'url' | 'screenshot'>('manual');
+  const [printHint, setPrintHint] = useState<string | null>(null);
   const [usages, setUsages] = useState<UsageDraft[]>([]);
 
   // Settlement Form State
@@ -126,14 +166,20 @@ export default function SpoolSplitApp() {
     }
     // Prints and their filament rows are loaded separately and joined here, so this works even if
     // the database has no foreign key between print_spool_usages.print_id and prints.id.
-    const [u, s, p, pu, st] = await Promise.all([
+    const [u, s, p, pu, st, pa] = await Promise.all([
       supabase.from('users').select('*').order('name'),
       supabase.from('spools').select('*').order('created_at', { ascending: false }),
       supabase.from('prints').select('*').order('created_at', { ascending: false }),
       supabase.from('print_spool_usages').select('*'),
       supabase.from('settlements').select('*').order('settled_at', { ascending: false }),
+      supabase.from('parts').select('*').order('purchased_at', { ascending: false }),
     ]);
-    const firstError = [u, s, p, pu, st].find((r) => r.error)?.error;
+    if (pa.error && /parts/.test(pa.error.message)) {
+      throw new Error(
+        `Could not load data: the "parts" table is missing. Run supabase/add-parts.sql once in the Supabase SQL Editor. (${pa.error.message})`
+      );
+    }
+    const firstError = [u, s, p, pu, st, pa].find((r) => r.error)?.error;
     if (firstError) throw new Error(`Could not load data: ${firstError.message}`);
 
     const userRows = (u.data || []) as User[];
@@ -162,6 +208,7 @@ export default function SpoolSplitApp() {
       }))
     );
     setSettlements((st.data || []) as Settlement[]);
+    setParts((pa.data || []) as Part[]);
   };
 
   useEffect(() => {
@@ -222,6 +269,9 @@ export default function SpoolSplitApp() {
       });
     }
 
+    // Parts (nozzles, tubes, plates…) are split by each person's print time since the part was bought.
+    userAOwesUserB += partsBalanceAOwesB(parts, prints, [userA.id, userB.id]);
+
     settlements.forEach((st) => {
       const amt = Number(st.amount || 0);
       if (st.from_user_id === userA.id && st.to_user_id === userB.id) {
@@ -242,11 +292,11 @@ export default function SpoolSplitApp() {
       debtorId: debtor.id,
       creditorId: creditor.id,
     };
-  }, [users, allSpools, prints, settlements, splitMode]);
+  }, [users, allSpools, prints, settlements, parts, splitMode]);
 
   /**
    * What each person has put in, net of settlements:
-   * spools they bought + payments they sent − payments they received.
+   * spools and parts they bought + payments they sent − payments they received.
    */
   const contributions = useMemo(
     () =>
@@ -254,15 +304,31 @@ export default function SpoolSplitApp() {
         const spoolSpend = allSpools
           .filter((s) => s.paid_by_user_id === u.id)
           .reduce((sum, s) => sum + Number(s.purchase_price || 0), 0);
+        const partsSpend = parts
+          .filter((pt) => pt.paid_by_user_id === u.id)
+          .reduce((sum, pt) => sum + Number(pt.price || 0), 0);
         const sent = settlements
           .filter((st) => st.from_user_id === u.id)
           .reduce((sum, st) => sum + Number(st.amount || 0), 0);
         const received = settlements
           .filter((st) => st.to_user_id === u.id)
           .reduce((sum, st) => sum + Number(st.amount || 0), 0);
-        return { user: u, spoolSpend, sent, received, net: spoolSpend + sent - received };
+        return {
+          user: u,
+          spoolSpend,
+          partsSpend,
+          sent,
+          received,
+          net: spoolSpend + partsSpend + sent - received,
+        };
       }),
-    [users, allSpools, settlements]
+    [users, allSpools, parts, settlements]
+  );
+
+  /** All-time print minutes per person (shared prints count half each). */
+  const printTimeTotals = useMemo(
+    () => (users.length >= 2 ? printMinutesByUser(prints, [users[0].id, users[1].id]) : {}),
+    [users, prints]
   );
 
   const handleReceiptParse = (file?: File) =>
@@ -280,11 +346,31 @@ export default function SpoolSplitApp() {
           mimeType,
           rawText: receiptText,
         });
-        if (!Array.isArray(data.spools) || data.spools.length === 0) {
-          throw new Error('No spools were found on that receipt');
+        const foundSpools: any[] = Array.isArray(data.spools) ? data.spools : [];
+        const foundParts: any[] = Array.isArray(data.parts) ? data.parts : [];
+        if (foundSpools.length === 0 && foundParts.length === 0) {
+          throw new Error('No spools or parts were found on that receipt');
         }
+        if (typeof data.order_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(data.order_date)) {
+          setReceiptDate(data.order_date);
+        }
+        const expandedParts: StagedPart[] = [];
+        foundParts.forEach((pt: any) => {
+          const qty = Math.max(1, Math.min(50, Number(pt.quantity) || 1));
+          const category: PartCategory = PART_CATEGORIES.includes(pt.category) ? pt.category : 'other';
+          for (let i = 0; i < qty; i++) {
+            expandedParts.push(
+              newStagedPart({
+                name: pt.name || PART_CATEGORY_LABELS[category],
+                category,
+                price: Number(pt.unit_landed_cost || 0).toFixed(2),
+              })
+            );
+          }
+        });
+        setStagedParts(expandedParts);
         const expanded: StagedSpool[] = [];
-        data.spools.forEach((s: any) => {
+        foundSpools.forEach((s: any) => {
           const qty = Math.max(1, Math.min(50, Number(s.quantity) || 1));
           for (let i = 0; i < qty; i++) {
             expanded.push(
@@ -308,10 +394,15 @@ export default function SpoolSplitApp() {
   const updateStaged = (idx: number, patch: Partial<StagedSpool>) =>
     setStagedSpools((prev) => prev.map((s, i) => (i === idx ? { ...s, ...patch } : s)));
 
-  const saveStagedSpools = () =>
+  const updateStagedPart = (idx: number, patch: Partial<StagedPart>) =>
+    setStagedParts((prev) => prev.map((pt, i) => (i === idx ? { ...pt, ...patch } : pt)));
+
+  const saveStagedPurchase = () =>
     run(async () => {
-      if (stagedSpools.length === 0) return;
-      const rows = stagedSpools.map((s) => {
+      if (stagedSpools.length === 0 && stagedParts.length === 0) return;
+      const paidBy = receiptPaidBy || activeUserId;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(receiptDate)) throw new Error('Pick the purchase date');
+      const spoolRows = stagedSpools.map((s) => {
         const weight = Number(s.initial_weight_g);
         const price = Number(s.purchase_price);
         if (!(weight > 0)) throw new Error(`Spool "${s.color_name}" needs a weight above 0 g`);
@@ -324,19 +415,52 @@ export default function SpoolSplitApp() {
           initial_weight_g: weight,
           remaining_weight_g: weight,
           purchase_price: price,
-          paid_by_user_id: receiptPaidBy || activeUserId,
+          paid_by_user_id: paidBy,
+        };
+      });
+      const partRows = stagedParts.map((pt) => {
+        const price = Number(pt.price);
+        if (!pt.name.trim()) throw new Error('Every part needs a name');
+        if (pt.price === '' || !(price >= 0)) throw new Error(`Part "${pt.name}" needs a valid price`);
+        return {
+          name: pt.name.trim(),
+          category: pt.category,
+          price: Number(price.toFixed(2)),
+          paid_by_user_id: paidBy,
+          purchased_at: receiptDate,
         };
       });
       setSaving(true);
       try {
-        check(await supabase.from('spools').insert(rows));
+        let insertedSpoolIds: string[] = [];
+        if (spoolRows.length > 0) {
+          const { data } = check(await supabase.from('spools').insert(spoolRows).select('id'));
+          insertedSpoolIds = (data || []).map((r: { id: string }) => r.id);
+        }
+        if (partRows.length > 0) {
+          const partRes = await supabase.from('parts').insert(partRows);
+          if (partRes.error) {
+            // Keep the purchase all-or-nothing so a retry doesn't duplicate the spools
+            if (insertedSpoolIds.length > 0) await supabase.from('spools').delete().in('id', insertedSpoolIds);
+            throw new Error(partRes.error.message);
+          }
+        }
         setStagedSpools([]);
+        setStagedParts([]);
         setReceiptText('');
         setShowReceiptModal(false);
         await fetchAllData();
       } finally {
         setSaving(false);
       }
+    });
+
+  const deletePart = (part: Part) =>
+    run(async () => {
+      if (!confirm(`Delete "${part.name}" (${money(Number(part.price))})? Its cost will be removed from the balance.`))
+        return;
+      check(await supabase.from('parts').delete().eq('id', part.id));
+      await fetchAllData();
     });
 
   const archiveSpool = (id: string) =>
@@ -361,8 +485,19 @@ export default function SpoolSplitApp() {
           rawText: printNoteOrUrl,
           activeSpools: spools,
         });
-        if (data.title) setPrintTitle(data.title);
-        if (data.duration_minutes) setPrintDuration(data.duration_minutes);
+        const title = typeof data.title === 'string' ? data.title.trim() : '';
+        if (title) {
+          setPrintTitle(title);
+          setPrintHint(null);
+        } else {
+          setPrintHint("Couldn't read the print's name — please type it.");
+        }
+        const minutes = Math.round(Number(data.duration_minutes) || 0);
+        if (minutes > 0) {
+          setPrintHours(String(Math.floor(minutes / 60)));
+          setPrintMins(String(minutes % 60));
+        }
+        setPrintSource(file ? 'screenshot' : 'url');
         if (Array.isArray(data.filament_usages) && data.filament_usages.length > 0) {
           setUsages(
             data.filament_usages.map((u: any) => ({
@@ -385,7 +520,10 @@ export default function SpoolSplitApp() {
   const resetPrintForm = () => {
     setPrintTitle('');
     setPrintNoteOrUrl('');
-    setPrintDuration(60);
+    setPrintHours('');
+    setPrintMins('');
+    setPrintSource('manual');
+    setPrintHint(null);
     setIsSharedPrint(false);
     setUsages([]);
   };
@@ -393,6 +531,8 @@ export default function SpoolSplitApp() {
   const savePrintJob = () =>
     run(async () => {
       if (!printTitle.trim()) throw new Error('Give the print a name');
+      const durationMinutes = Math.round(Number(printHours || 0) * 60 + Number(printMins || 0));
+      if (!(durationMinutes > 0)) throw new Error('Enter the print time (hours and minutes)');
       if (usages.length === 0) throw new Error('Add at least one filament slot');
       for (const u of usages) {
         if (!spools.some((s) => s.id === u.spool_id)) throw new Error('Pick a spool for every slot');
@@ -423,8 +563,8 @@ export default function SpoolSplitApp() {
               title: printTitle.trim(),
               printed_by_user_id: isSharedPrint ? null : printedBy || activeUserId,
               is_shared_print: isSharedPrint,
-              duration_minutes: Number(printDuration || 0),
-              source_type: printNoteOrUrl ? 'url' : 'manual',
+              duration_minutes: durationMinutes,
+              source_type: printSource === 'screenshot' ? 'screenshot' : printNoteOrUrl ? 'url' : 'manual',
               source_url: printNoteOrUrl || null,
               total_grams: Number(totalGrams.toFixed(2)),
               total_cost: Number(totalCost.toFixed(2)),
@@ -518,6 +658,14 @@ export default function SpoolSplitApp() {
         p.is_shared_print ? 'Shared (50/50)' : userName(p.printed_by_user_id),
         p.total_grams,
         Number(p.total_cost).toFixed(2),
+      ]),
+      ...parts.map((pt) => [
+        pt.purchased_at,
+        'Part',
+        `${PART_CATEGORY_LABELS[pt.category] || pt.category}: ${pt.name}`,
+        `Paid by ${userName(pt.paid_by_user_id)}`,
+        '',
+        Number(pt.price).toFixed(2),
       ]),
       ...settlements.map((st) => [
         new Date(st.settled_at).toLocaleDateString(),
@@ -635,27 +783,29 @@ export default function SpoolSplitApp() {
         <button
           onClick={() => {
             setStagedSpools([newStagedSpool({ color_name: 'Jade White', color_hex: '#ffffff' })]);
+            setStagedParts([]);
+            setReceiptDate(todayIso());
             setShowReceiptModal(true);
           }}
           className="flex items-center justify-center gap-2 bg-slate-800 hover:bg-slate-700 text-slate-100 font-semibold py-3.5 px-4 rounded-xl border border-slate-700 transition"
         >
           <Receipt className="w-4 h-4 text-emerald-400" />
-          Scan Bill / Add Spool
+          Scan Bill / Add Purchase
         </button>
       </div>
 
-      <div className="flex border-b border-slate-800 mb-4 text-sm font-medium">
+      <div className="flex border-b border-slate-800 mb-4 text-sm font-medium overflow-x-auto whitespace-nowrap">
         {(
           [
             ['prints', `Print History (${prints.length})`],
-            ['spools', `Spool Rack (${spools.length})`],
+            ['spools', `Rack & Parts (${spools.length + parts.length})`],
             ['settle', `Settlements (${settlements.length})`],
           ] as const
         ).map(([key, label]) => (
           <button
             key={key}
             onClick={() => setActiveTab(key)}
-            className={`pb-3 px-4 border-b-2 transition ${
+            className={`pb-3 px-3 sm:px-4 border-b-2 transition ${
               activeTab === key ? 'border-emerald-500 text-emerald-400' : 'border-transparent text-slate-400'
             }`}
           >
@@ -669,7 +819,7 @@ export default function SpoolSplitApp() {
           {prints.length === 0 ? (
             <div className="text-center py-12 bg-slate-900/40 rounded-2xl border border-slate-800/80 p-6">
               <p className="text-sm text-slate-400">
-                No prints logged yet. Tap <strong>Scan Bill / Add Spool</strong> first, then log your first print!
+                No prints logged yet. Tap <strong>Scan Bill / Add Purchase</strong> first, then log your first print!
               </p>
             </div>
           ) : (
@@ -686,7 +836,9 @@ export default function SpoolSplitApp() {
                     </span>
                   </div>
                   <p className="text-xs text-slate-400 mt-1">
-                    {Number(p.total_grams).toFixed(0)}g used • {new Date(p.created_at).toLocaleDateString()}
+                    {Number(p.total_grams).toFixed(0)}g used
+                    {Number(p.duration_minutes) > 0 ? ` • ${formatMinutes(Number(p.duration_minutes))}` : ''} •{' '}
+                    {new Date(p.created_at).toLocaleDateString()}
                   </p>
                 </div>
                 <div className="flex items-center gap-3">
@@ -709,7 +861,7 @@ export default function SpoolSplitApp() {
         <div className="space-y-3">
           {spools.length === 0 && (
             <div className="text-center py-12 bg-slate-900/40 rounded-2xl border border-slate-800/80 p-6">
-              <p className="text-sm text-slate-400">No active spools. Add one with Scan Bill / Add Spool.</p>
+              <p className="text-sm text-slate-400">No active spools. Add one with Scan Bill / Add Purchase.</p>
             </div>
           )}
           {spools.map((s) => {
@@ -747,6 +899,70 @@ export default function SpoolSplitApp() {
               </div>
             );
           })}
+
+          <div className="pt-4 space-y-3">
+            <div className="flex items-center gap-2">
+              <Wrench className="w-4 h-4 text-emerald-400" />
+              <h3 className="text-sm font-semibold">Parts & Upkeep</h3>
+            </div>
+            <p className="text-xs text-slate-400">
+              Nozzles, tubes, plates and other parts are split by print time: each person pays their share of
+              the hours printed since the part was bought. All-time print time:{' '}
+              {users
+                .map((u) => `${u.name} ${formatMinutes(printTimeTotals[u.id] || 0)}`)
+                .join(' • ')}
+            </p>
+            {parts.length === 0 ? (
+              <div className="text-center py-6 bg-slate-900/40 rounded-xl border border-slate-800/80 p-4">
+                <p className="text-xs text-slate-400">
+                  No parts yet. Add them with Scan Bill / Add Purchase — receipts with nozzles or tubes are picked up
+                  automatically.
+                </p>
+              </div>
+            ) : (
+              parts.map((pt) => {
+                const shares =
+                  users.length >= 2 ? partShares(pt, prints, [users[0].id, users[1].id]) : ({} as Record<string, number>);
+                return (
+                  <div
+                    key={pt.id}
+                    className="bg-slate-900 border border-slate-800 rounded-xl p-4 flex items-center justify-between gap-3"
+                  >
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="font-semibold text-sm truncate">{pt.name}</span>
+                        <span className="text-[11px] px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 shrink-0">
+                          {PART_CATEGORY_LABELS[pt.category] || pt.category}
+                        </span>
+                      </div>
+                      <p className="text-xs text-slate-400 mt-1">
+                        Paid by {userName(pt.paid_by_user_id)} • {new Date(`${pt.purchased_at}T00:00:00`).toLocaleDateString()}
+                      </p>
+                      {users.length >= 2 && (
+                        <p className="text-xs text-slate-500 mt-0.5">
+                          Split so far:{' '}
+                          {users
+                            .slice(0, 2)
+                            .map((u) => `${u.name} ${Math.round((shares[u.id] || 0) * 100)}%`)
+                            .join(' / ')}
+                        </p>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-3 shrink-0">
+                      <span className="text-sm font-bold text-emerald-400">{money(Number(pt.price))}</span>
+                      <button
+                        onClick={() => deletePart(pt)}
+                        className="text-slate-500 hover:text-rose-400 p-1"
+                        title="Delete part"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
         </div>
       )}
 
@@ -762,6 +978,10 @@ export default function SpoolSplitApp() {
                   <p className="flex justify-between text-slate-400">
                     <span>Spools bought</span>
                     <span>{money(c.spoolSpend)}</span>
+                  </p>
+                  <p className="flex justify-between text-slate-400">
+                    <span>Parts bought</span>
+                    <span>{money(c.partsSpend)}</span>
                   </p>
                   <p className="flex justify-between text-slate-400">
                     <span>+ Paid to other</span>
@@ -907,7 +1127,7 @@ export default function SpoolSplitApp() {
             <div className="flex justify-between items-center">
               <h2 className="text-base font-bold flex items-center gap-2">
                 <Sparkles className="w-4 h-4 text-emerald-400" />
-                Add Filament Spools (AI Receipt or Manual)
+                Add Purchase (Spools & Parts)
               </h2>
               <button onClick={() => setShowReceiptModal(false)} className="text-slate-400 text-sm">
                 Close
@@ -948,26 +1168,38 @@ export default function SpoolSplitApp() {
               </div>
               {aiLoading && (
                 <p className="text-xs text-emerald-400 mt-2 flex items-center justify-center gap-1">
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" /> Gemini is extracting spools...
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" /> Gemini is reading the receipt...
                 </p>
               )}
             </div>
 
-            <div>
-              <label className="text-xs text-slate-400">Who paid this bill?</label>
-              <select
-                value={receiptPaidBy}
-                onChange={(e) => setReceiptPaidBy(e.target.value)}
-                className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-sm mt-1"
-              >
-                {users.map((u) => (
-                  <option key={u.id} value={u.id}>
-                    {u.name}
-                  </option>
-                ))}
-              </select>
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="text-xs text-slate-400">Who paid this bill?</label>
+                <select
+                  value={receiptPaidBy}
+                  onChange={(e) => setReceiptPaidBy(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-sm mt-1"
+                >
+                  {users.map((u) => (
+                    <option key={u.id} value={u.id}>
+                      {u.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="text-xs text-slate-400">Purchase date</label>
+                <input
+                  type="date"
+                  value={receiptDate}
+                  onChange={(e) => setReceiptDate(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-sm mt-1"
+                />
+              </div>
             </div>
 
+            <h3 className="text-xs font-semibold text-slate-300">Filament spools</h3>
             <div className="space-y-2 max-h-60 overflow-y-auto">
               {stagedSpools.map((sp, idx) => (
                 <div
@@ -1023,15 +1255,71 @@ export default function SpoolSplitApp() {
               onClick={() => setStagedSpools([...stagedSpools, newStagedSpool()])}
               className="text-xs text-emerald-400 font-medium"
             >
-              + Add Another Spool Row
+              + Add Spool Row
             </button>
 
+            <div className="space-y-2">
+              <h3 className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
+                <Wrench className="w-3.5 h-3.5 text-emerald-400" />
+                Parts & upkeep <span className="font-normal text-slate-500">(split by print time)</span>
+              </h3>
+              <div className="space-y-2 max-h-60 overflow-y-auto">
+                {stagedParts.map((pt, idx) => (
+                  <div
+                    key={idx}
+                    className="grid grid-cols-[2fr_1.3fr_1fr_auto] items-center gap-1.5 bg-slate-950 p-2 rounded-lg border border-slate-800 text-xs"
+                  >
+                    <input
+                      value={pt.name}
+                      onChange={(e) => updateStagedPart(idx, { name: e.target.value })}
+                      placeholder="e.g. 0.4mm nozzle"
+                      className="bg-slate-900 p-1.5 rounded min-w-0"
+                    />
+                    <select
+                      value={pt.category}
+                      onChange={(e) => updateStagedPart(idx, { category: e.target.value as PartCategory })}
+                      className="bg-slate-900 p-1.5 rounded min-w-0"
+                    >
+                      {PART_CATEGORIES.map((c) => (
+                        <option key={c} value={c}>
+                          {PART_CATEGORY_LABELS[c]}
+                        </option>
+                      ))}
+                    </select>
+                    <input
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      value={pt.price}
+                      onChange={(e) => updateStagedPart(idx, { price: e.target.value })}
+                      placeholder="$ Price"
+                      className="bg-slate-900 p-1.5 rounded min-w-0"
+                    />
+                    <button
+                      onClick={() => setStagedParts((prev) => prev.filter((_, i) => i !== idx))}
+                      className="text-slate-500 hover:text-rose-400 p-1"
+                      title="Remove part"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <button
+                onClick={() => setStagedParts([...stagedParts, newStagedPart()])}
+                className="text-xs text-emerald-400 font-medium"
+              >
+                + Add Part Row
+              </button>
+            </div>
+
             <button
-              onClick={saveStagedSpools}
-              disabled={saving || stagedSpools.length === 0}
+              onClick={saveStagedPurchase}
+              disabled={saving || (stagedSpools.length === 0 && stagedParts.length === 0)}
               className="w-full bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-white font-semibold py-3 rounded-xl text-sm"
             >
               Confirm & Save {stagedSpools.length} Spool(s)
+              {stagedParts.length > 0 ? ` + ${stagedParts.length} Part(s)` : ''}
             </button>
           </div>
         </div>
@@ -1088,12 +1376,47 @@ export default function SpoolSplitApp() {
               )}
             </div>
 
-            <input
-              value={printTitle}
-              onChange={(e) => setPrintTitle(e.target.value)}
-              placeholder="Model Name (e.g., Gridfinity Bin)"
-              className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-sm"
-            />
+            <div>
+              <input
+                value={printTitle}
+                onChange={(e) => {
+                  setPrintTitle(e.target.value);
+                  setPrintHint(null);
+                }}
+                placeholder="Model Name (e.g., Gridfinity Bin)"
+                className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-sm"
+              />
+              {printHint && <p className="text-xs text-amber-300 mt-1">{printHint}</p>}
+            </div>
+
+            <div>
+              <label className="text-xs text-slate-400">Print time (used to split parts like nozzles)</label>
+              <div className="flex items-center gap-2 mt-1">
+                <input
+                  type="number"
+                  min="0"
+                  inputMode="numeric"
+                  value={printHours}
+                  onChange={(e) => setPrintHours(e.target.value)}
+                  placeholder="0"
+                  aria-label="Hours"
+                  className="w-20 bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-sm"
+                />
+                <span className="text-xs text-slate-400">h</span>
+                <input
+                  type="number"
+                  min="0"
+                  max="59"
+                  inputMode="numeric"
+                  value={printMins}
+                  onChange={(e) => setPrintMins(e.target.value)}
+                  placeholder="0"
+                  aria-label="Minutes"
+                  className="w-20 bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-sm"
+                />
+                <span className="text-xs text-slate-400">min</span>
+              </div>
+            </div>
 
             <select
               value={isSharedPrint ? 'shared' : printedBy}

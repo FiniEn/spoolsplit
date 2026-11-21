@@ -60,6 +60,19 @@ create table if not exists settlements (
   check (from_user_id <> to_user_id)
 );
 
+-- Printer parts and upkeep (nozzles, PTFE tubes, build plates, ...). Split by print time.
+create table if not exists parts (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  category text not null default 'other'
+    check (category in ('nozzle', 'hotend', 'ptfe_tube', 'build_plate', 'ams_part', 'maintenance', 'other')),
+  price numeric not null check (price >= 0),
+  paid_by_user_id uuid not null references users (id),
+  purchased_at date not null default current_date,
+  note text,
+  created_at timestamptz not null default now()
+);
+
 -- The app uses the public anon key from the browser and has no login yet, so these policies let
 -- anyone holding the anon key read and write. Keep the app URL private, or add Supabase Auth and
 -- tighten these to authenticated users.
@@ -68,6 +81,7 @@ alter table spools enable row level security;
 alter table prints enable row level security;
 alter table print_spool_usages enable row level security;
 alter table settlements enable row level security;
+alter table parts enable row level security;
 
 drop policy if exists "anon full access" on users;
 create policy "anon full access" on users for all using (true) with check (true);
@@ -79,6 +93,8 @@ drop policy if exists "anon full access" on print_spool_usages;
 create policy "anon full access" on print_spool_usages for all using (true) with check (true);
 drop policy if exists "anon full access" on settlements;
 create policy "anon full access" on settlements for all using (true) with check (true);
+drop policy if exists "anon full access" on parts;
+create policy "anon full access" on parts for all using (true) with check (true);
 
 -- Seed the two people (the app expects exactly two users).
 insert into users (name, avatar_color)

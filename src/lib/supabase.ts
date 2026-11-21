@@ -71,3 +71,36 @@ export interface Settlement {
   note?: string | null;
   settled_at: string;
 }
+
+export const PART_CATEGORIES = [
+  'nozzle',
+  'hotend',
+  'ptfe_tube',
+  'build_plate',
+  'ams_part',
+  'maintenance',
+  'other',
+] as const;
+export type PartCategory = (typeof PART_CATEGORIES)[number];
+
+export const PART_CATEGORY_LABELS: Record<PartCategory, string> = {
+  nozzle: 'Nozzle',
+  hotend: 'Hotend',
+  ptfe_tube: 'PTFE tube',
+  build_plate: 'Build plate',
+  ams_part: 'AMS part',
+  maintenance: 'Maintenance',
+  other: 'Other',
+};
+
+/** A printer part or upkeep purchase. Its cost is split by each person's print time since purchase. */
+export interface Part {
+  id: string;
+  name: string;
+  category: PartCategory;
+  price: number;
+  paid_by_user_id: string;
+  purchased_at: string; // YYYY-MM-DD
+  note?: string | null;
+  created_at: string;
+}

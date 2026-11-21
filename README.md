@@ -2,8 +2,9 @@
 
 A small web app for two people sharing a Bambu Lab 3D printer. It tracks what each person spent on filament and used in prints, and keeps a running balance of who owes whom.
 
-- **Spools:** add spools by hand, or upload a receipt and Gemini fills them in, spreading tax and shipping across each spool.
-- **Prints:** log a print by hand, or upload a Bambu Handy / Studio screenshot or paste a MakerWorld link. Each print's cost is worked out from the grams used and the spool's price per gram.
+- **Purchases:** add spools and parts by hand, or upload a receipt and Gemini fills them in. Tax and shipping are spread across every item, and parts (nozzles, hotends, PTFE tubes, build plates, AMS parts, maintenance) go in their own list.
+- **Prints:** log a print by hand, or upload a Bambu Handy / Studio screenshot or paste a MakerWorld link, and the name, print time and grams fill in. Each print's cost is worked out from the grams used and the spool's price per gram.
+- **Parts split by print time:** each part's price is shared in proportion to the hours each person printed since it was bought. Shared prints count half each, and the split is 50/50 until someone prints. This applies in both balance modes.
 - **Balance modes:**
   - *Pay Per Gram Used:* you pay the other person for their filament that you use.
   - *50/50 Spool Pool:* all spool purchases are split evenly.
@@ -12,7 +13,7 @@ A small web app for two people sharing a Bambu Lab 3D printer. It tracks what ea
 
 ## Setup
 
-1. Create a Supabase project and run `supabase/schema.sql` in its SQL editor. This creates the tables and the two users; edit the names in the last statement.
+1. Create a Supabase project and run `supabase/schema.sql` in its SQL editor. If your database was set up before parts existed, run `supabase/add-parts.sql` once instead. This creates the tables and the two users; edit the names in the last statement.
 2. Copy `.env.example` to `.env.local` and fill in your Supabase URL, anon key, and Gemini API key.
 3. Run `npm install`, then `npm run dev`.
 
