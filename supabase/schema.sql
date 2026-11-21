@@ -1,6 +1,6 @@
 -- SpoolSplit database schema.
 -- Run in the Supabase SQL editor on a fresh project. It matches the fields the app reads and writes
--- (see src/lib/supabase.ts). If you already have tables, compare before running.
+-- (see src/lib/supabase.ts). Safe to run more than once. If you already have tables, compare before running.
 
 create extension if not exists "pgcrypto";
 
@@ -69,10 +69,15 @@ alter table prints enable row level security;
 alter table print_spool_usages enable row level security;
 alter table settlements enable row level security;
 
+drop policy if exists "anon full access" on users;
 create policy "anon full access" on users for all using (true) with check (true);
+drop policy if exists "anon full access" on spools;
 create policy "anon full access" on spools for all using (true) with check (true);
+drop policy if exists "anon full access" on prints;
 create policy "anon full access" on prints for all using (true) with check (true);
+drop policy if exists "anon full access" on print_spool_usages;
 create policy "anon full access" on print_spool_usages for all using (true) with check (true);
+drop policy if exists "anon full access" on settlements;
 create policy "anon full access" on settlements for all using (true) with check (true);
 
 -- Seed the two people (the app expects exactly two users).
