@@ -4,12 +4,11 @@ A small web app for two people sharing a Bambu Lab 3D printer. It tracks what ea
 
 - **Purchases:** add spools and parts by hand, or upload a receipt and Gemini fills them in. Tax and shipping are spread across every item, and parts (nozzles, hotends, PTFE tubes, build plates, AMS parts, maintenance) go in their own list.
 - **Prints:** log a print by hand, or upload a Bambu Handy / Studio screenshot or paste a MakerWorld link, and the name, print time and grams fill in. Each print's cost is worked out from the grams used and the spool's price per gram.
-- **Parts split by print time:** each part's price is shared in proportion to the hours each person printed since it was bought. Shared prints count half each, and the split is 50/50 until someone prints. This applies in both balance modes.
-- **Balance modes:**
-  - *Pay Per Gram Used:* you pay the other person for their filament that you use.
-  - *50/50 Spool Pool:* all spool purchases are split evenly.
-- **Settle up:** record who paid whom (Venmo, Zelle, cash and so on). Payments are subtracted from the balance and from each person's "net contributed" total. The **Settle Up** button fills in the full outstanding amount.
-- **CSV export** of prints and payments.
+- **Parts split by print time:** each part's price is shared in proportion to the hours each person printed since it was bought. Shared prints count half each, and the split is 50/50 until someone prints.
+- **Wallet model:** whoever buys a spool or part pays from their own wallet. You owe the other person only for what you use of *their* purchases. Using your own costs nothing, and shared prints split half each. Everything nets out to **at most one payment** between you.
+- **Settle up:** the Wallet tab shows the one payment that settles everything ("Fini pays Mike $8.67"). Recording it closes the period, which also locks the print-time split of any parts bought before it. You can still record partial payments.
+- **History:** every purchase, print, part and payment is listed with what it changed and the balance after it, grouped by settle-up.
+- **CSV export** of the full wallet history.
 
 ## Setup
 

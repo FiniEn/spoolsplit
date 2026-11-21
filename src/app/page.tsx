@@ -15,12 +15,12 @@ import {
   PART_CATEGORIES,
   PART_CATEGORY_LABELS,
 } from '@/lib/supabase';
-import { formatMinutes, partShares, partsBalanceAOwesB, printMinutesByUser } from '@/lib/split';
+import { formatMinutes, printMinutesByUser } from '@/lib/split';
+import { computeWallet, WalletEntry } from '@/lib/wallet';
 import {
   Disc,
   Printer,
   Receipt,
-  ArrowRightLeft,
   Download,
   Sparkles,
   Trash2,
@@ -30,6 +30,7 @@ import {
   X,
   HandCoins,
   Wrench,
+  CheckCircle2,
 } from 'lucide-react';
 
 type StagedSpool = {
@@ -107,7 +108,6 @@ export default function SpoolSplitApp() {
   const [prints, setPrints] = useState<PrintJob[]>([]);
   const [settlements, setSettlements] = useState<Settlement[]>([]);
   const [parts, setParts] = useState<Part[]>([]);
-  const [splitMode, setSplitMode] = useState<'usage' | 'pool'>('usage');
   const [activeTab, setActiveTab] = useState<'prints' | 'spools' | 'settle'>('prints');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -141,6 +141,7 @@ export default function SpoolSplitApp() {
   const [settleAmount, setSettleAmount] = useState('');
   const [settleMethod, setSettleMethod] = useState('Venmo');
   const [settleNote, setSettleNote] = useState('');
+  const [showOtherAmount, setShowOtherAmount] = useState(false);
 
   const spools = useMemo(() => allSpools.filter((s) => !s.is_archived), [allSpools]);
   const userName = (id: string | null | undefined) =>
@@ -228,102 +229,38 @@ export default function SpoolSplitApp() {
     });
 
   /**
-   * Running balance between the two users. Positive = userA owes userB.
-   * Settlements (payments between the two) are deducted from what is owed.
+   * Wallet: replays every purchase, print and payment. Using your own purchases costs nothing;
+   * using the other person's means you owe them. Nets to at most one payment between the two.
    */
-  const ledger = useMemo(() => {
-    if (users.length < 2) {
-      return { text: 'Setting up users...', amount: 0, debtorId: '', creditorId: '' };
-    }
-    const [userA, userB] = users;
-    let userAOwesUserB = 0;
-
-    if (splitMode === 'usage') {
-      prints.forEach((p) => {
-        (p.print_spool_usages || []).forEach((u) => {
-          const spool = allSpools.find((s) => s.id === u.spool_id);
-          if (!spool) return;
-          const cost = Number(u.calculated_cost || 0);
-
-          if (p.is_shared_print) {
-            if (spool.paid_by_user_id === userA.id) userAOwesUserB -= cost / 2;
-            if (spool.paid_by_user_id === userB.id) userAOwesUserB += cost / 2;
-          } else if (p.printed_by_user_id === userA.id && spool.paid_by_user_id === userB.id) {
-            userAOwesUserB += cost;
-          } else if (p.printed_by_user_id === userB.id && spool.paid_by_user_id === userA.id) {
-            userAOwesUserB -= cost;
-          }
-        });
-      });
-    } else {
-      allSpools.forEach((s) => {
-        const price = Number(s.purchase_price || 0);
-        if (s.paid_by_user_id === userA.id) userAOwesUserB -= price / 2;
-        if (s.paid_by_user_id === userB.id) userAOwesUserB += price / 2;
-      });
-      prints.forEach((p) => {
-        if (p.is_shared_print) return;
-        const cost = Number(p.total_cost || 0);
-        if (p.printed_by_user_id === userA.id) userAOwesUserB += cost / 2;
-        if (p.printed_by_user_id === userB.id) userAOwesUserB -= cost / 2;
-      });
-    }
-
-    // Parts (nozzles, tubes, plates…) are split by each person's print time since the part was bought.
-    userAOwesUserB += partsBalanceAOwesB(parts, prints, [userA.id, userB.id]);
-
-    settlements.forEach((st) => {
-      const amt = Number(st.amount || 0);
-      if (st.from_user_id === userA.id && st.to_user_id === userB.id) {
-        userAOwesUserB -= amt;
-      } else if (st.from_user_id === userB.id && st.to_user_id === userA.id) {
-        userAOwesUserB += amt;
-      }
-    });
-
-    const absAmount = Math.abs(userAOwesUserB);
-    if (absAmount < 0.01) {
-      return { text: 'All settled up!', amount: 0, debtorId: '', creditorId: '' };
-    }
-    const [debtor, creditor] = userAOwesUserB > 0 ? [userA, userB] : [userB, userA];
-    return {
-      text: `${debtor.name} owes ${creditor.name}`,
-      amount: absAmount,
-      debtorId: debtor.id,
-      creditorId: creditor.id,
-    };
-  }, [users, allSpools, prints, settlements, parts, splitMode]);
-
-  /**
-   * What each person has put in, net of settlements:
-   * spools and parts they bought + payments they sent − payments they received.
-   */
-  const contributions = useMemo(
-    () =>
-      users.map((u) => {
-        const spoolSpend = allSpools
-          .filter((s) => s.paid_by_user_id === u.id)
-          .reduce((sum, s) => sum + Number(s.purchase_price || 0), 0);
-        const partsSpend = parts
-          .filter((pt) => pt.paid_by_user_id === u.id)
-          .reduce((sum, pt) => sum + Number(pt.price || 0), 0);
-        const sent = settlements
-          .filter((st) => st.from_user_id === u.id)
-          .reduce((sum, st) => sum + Number(st.amount || 0), 0);
-        const received = settlements
-          .filter((st) => st.to_user_id === u.id)
-          .reduce((sum, st) => sum + Number(st.amount || 0), 0);
-        return {
-          user: u,
-          spoolSpend,
-          partsSpend,
-          sent,
-          received,
-          net: spoolSpend + partsSpend + sent - received,
-        };
-      }),
-    [users, allSpools, parts, settlements]
+  const wallet = useMemo(
+    () => computeWallet({ users, spools: allSpools, prints, parts, settlements }),
+    [users, allSpools, prints, parts, settlements]
   );
+  const ledger = {
+    text:
+      users.length < 2
+        ? 'Setting up users...'
+        : wallet.debtorId
+          ? `${userName(wallet.debtorId)} owes ${userName(wallet.creditorId)}`
+          : 'All settled up!',
+    amount: wallet.amount,
+    debtorId: wallet.debtorId,
+    creditorId: wallet.creditorId,
+  };
+
+  /** Short label for what a history entry did to the balance. */
+  const entryBadge = (e: WalletEntry) => {
+    if (e.kind === 'payment') return { text: `paid ${money(e.amount || 0)}`, tone: 'pay' as const };
+    if (Math.abs(e.delta) < 0.005) return { text: 'no transfer', tone: 'none' as const };
+    const credited = e.delta > 0 ? users[1] : users[0];
+    return { text: `${credited?.name} +${money(Math.abs(e.delta))}`, tone: 'owe' as const };
+  };
+  const runningLabel = (v: number) => {
+    if (users.length < 2 || Math.abs(v) < 0.005) return 'even';
+    return v > 0
+      ? `${users[0].name} owes ${users[1].name} ${money(v)}`
+      : `${users[1].name} owes ${users[0].name} ${money(-v)}`;
+  };
 
   /** All-time print minutes per person (shared prints count half each). */
   const printTimeTotals = useMemo(
@@ -598,13 +535,40 @@ export default function SpoolSplitApp() {
       await fetchAllData();
     });
 
-  const prefillFullSettlement = () => {
-    if (!ledger.debtorId) return;
-    setSettleFrom(ledger.debtorId);
-    setSettleTo(ledger.creditorId);
-    setSettleAmount(ledger.amount.toFixed(2));
-    setActiveTab('settle');
+  const openOtherAmount = () => {
+    if (ledger.debtorId) {
+      setSettleFrom(ledger.debtorId);
+      setSettleTo(ledger.creditorId);
+    }
+    setSettleAmount('');
+    setShowOtherAmount(true);
   };
+
+  /** Records one payment of the full balance, which closes the period ("settle up"). */
+  const recordFullSettlement = () =>
+    run(async () => {
+      if (!ledger.debtorId || !(ledger.amount > 0)) return;
+      if (
+        !confirm(`Record that ${userName(ledger.debtorId)} paid ${userName(ledger.creditorId)} ${money(ledger.amount)} via ${settleMethod}?`)
+      )
+        return;
+      setSaving(true);
+      try {
+        check(
+          await supabase.from('settlements').insert({
+            from_user_id: ledger.debtorId,
+            to_user_id: ledger.creditorId,
+            amount: Number(ledger.amount.toFixed(2)),
+            method: settleMethod,
+            note: settleNote.trim() || null,
+          })
+        );
+        setSettleNote('');
+        await fetchAllData();
+      } finally {
+        setSaving(false);
+      }
+    });
 
   const handleSettleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -625,6 +589,7 @@ export default function SpoolSplitApp() {
         );
         setSettleAmount('');
         setSettleNote('');
+        setShowOtherAmount(false);
         await fetchAllData();
       } finally {
         setSaving(false);
@@ -649,38 +614,27 @@ export default function SpoolSplitApp() {
       const s = String(v ?? '');
       return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     };
+    const periodsOldestFirst = [...wallet.periods].reverse();
     const rows: unknown[][] = [
-      ['Date', 'Type', 'Description', 'Who', 'Grams', 'Amount ($)'],
-      ...prints.map((p) => [
-        new Date(p.created_at).toLocaleDateString(),
-        'Print',
-        p.title,
-        p.is_shared_print ? 'Shared (50/50)' : userName(p.printed_by_user_id),
-        p.total_grams,
-        Number(p.total_cost).toFixed(2),
-      ]),
-      ...parts.map((pt) => [
-        pt.purchased_at,
-        'Part',
-        `${PART_CATEGORY_LABELS[pt.category] || pt.category}: ${pt.name}`,
-        `Paid by ${userName(pt.paid_by_user_id)}`,
-        '',
-        Number(pt.price).toFixed(2),
-      ]),
-      ...settlements.map((st) => [
-        new Date(st.settled_at).toLocaleDateString(),
-        'Payment',
-        [st.method, st.note].filter(Boolean).join(' - '),
-        `${userName(st.from_user_id)} -> ${userName(st.to_user_id)}`,
-        '',
-        Number(st.amount).toFixed(2),
-      ]),
+      ['Date', 'Type', 'Description', 'Details', 'Price / paid ($)', 'Change', 'Balance after', 'Period'],
+      ...periodsOldestFirst.flatMap((period, i) =>
+        period.entries.map((e) => [
+          new Date(e.when).toLocaleDateString(),
+          e.kind,
+          e.title,
+          e.detail,
+          e.amount != null ? e.amount.toFixed(2) : '',
+          entryBadge(e).text,
+          runningLabel(e.runningBalance),
+          period.closedBy ? `Settled ${new Date(period.closedBy.settled_at).toLocaleDateString()}` : i === periodsOldestFirst.length - 1 ? 'Open' : '',
+        ])
+      ),
     ];
     const csv = rows.map((r) => r.map(esc).join(',')).join('\n');
     const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
     const link = document.createElement('a');
     link.href = url;
-    link.download = 'spoolsplit_ledger.csv';
+    link.download = 'spoolsplit_wallet_history.csv';
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -733,15 +687,9 @@ export default function SpoolSplitApp() {
       <div className="bg-gradient-to-br from-slate-900 to-slate-900/60 border border-slate-800 rounded-2xl p-5 mb-5 shadow-lg">
         <div className="flex items-center justify-between mb-2">
           <span className="text-xs uppercase tracking-wider text-slate-400 font-semibold">
-            Live Fair-Split Balance
+            Wallet Balance
           </span>
-          <button
-            onClick={() => setSplitMode(splitMode === 'usage' ? 'pool' : 'usage')}
-            className="text-[11px] bg-slate-800 hover:bg-slate-700 text-slate-300 px-2.5 py-1 rounded-full flex items-center gap-1"
-          >
-            <ArrowRightLeft className="w-3 h-3" />
-            Mode: {splitMode === 'usage' ? 'Pay Per Gram Used' : '50/50 Spool Pool'}
-          </button>
+          <span className="hidden sm:inline text-[11px] text-slate-400">You pay for what you use of the other's stuff</span>
         </div>
 
         <div className="flex items-baseline justify-between">
@@ -758,7 +706,7 @@ export default function SpoolSplitApp() {
               <Download className="w-4 h-4" />
             </button>
             <button
-              onClick={() => (ledger.debtorId ? prefillFullSettlement() : setActiveTab('settle'))}
+              onClick={() => setActiveTab('settle')}
               className="bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold px-4 py-2.5 rounded-xl transition"
             >
               Settle Up
@@ -799,7 +747,7 @@ export default function SpoolSplitApp() {
           [
             ['prints', `Print History (${prints.length})`],
             ['spools', `Rack & Parts (${spools.length + parts.length})`],
-            ['settle', `Settlements (${settlements.length})`],
+            ['settle', 'Wallet'],
           ] as const
         ).map(([key, label]) => (
           <button
@@ -907,7 +855,8 @@ export default function SpoolSplitApp() {
             </div>
             <p className="text-xs text-slate-400">
               Nozzles, tubes, plates and other parts are split by print time: each person pays their share of
-              the hours printed since the part was bought. All-time print time:{' '}
+              the hours printed since the part was bought, until the next settle-up locks it. All-time print
+              time:{' '}
               {users
                 .map((u) => `${u.name} ${formatMinutes(printTimeTotals[u.id] || 0)}`)
                 .join(' • ')}
@@ -921,8 +870,8 @@ export default function SpoolSplitApp() {
               </div>
             ) : (
               parts.map((pt) => {
-                const shares =
-                  users.length >= 2 ? partShares(pt, prints, [users[0].id, users[1].id]) : ({} as Record<string, number>);
+                const split = wallet.partSplit.get(pt.id);
+                const shares = split?.shares || ({} as Record<string, number>);
                 return (
                   <div
                     key={pt.id}
@@ -940,7 +889,7 @@ export default function SpoolSplitApp() {
                       </p>
                       {users.length >= 2 && (
                         <p className="text-xs text-slate-500 mt-0.5">
-                          Split so far:{' '}
+                          {split?.frozen ? 'Split (locked at settle-up):' : 'Split so far:'}{' '}
                           {users
                             .slice(0, 2)
                             .map((u) => `${u.name} ${Math.round((shares[u.id] || 0) * 100)}%`)
@@ -968,154 +917,222 @@ export default function SpoolSplitApp() {
 
       {activeTab === 'settle' && (
         <div className="space-y-5">
-          {/* Who has put in how much, after payments between you */}
+          {/* 1. Settle up: always at most one payment */}
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3">
+            {ledger.debtorId ? (
+              <>
+                <div>
+                  <p className="text-xs uppercase tracking-wider text-slate-400 font-semibold">To settle up</p>
+                  <p className="text-lg font-bold mt-1">
+                    {userName(ledger.debtorId)} pays {userName(ledger.creditorId)}{' '}
+                    <span className="text-emerald-400">{money(ledger.amount)}</span>
+                  </p>
+                  <p className="text-xs text-slate-400 mt-0.5">
+                    One payment covers everything since the last settle-up. What each of you used of your own
+                    purchases needs no transfer.
+                  </p>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <select
+                    value={settleMethod}
+                    onChange={(e) => setSettleMethod(e.target.value)}
+                    className="bg-slate-950 border border-slate-800 rounded-lg p-2 text-sm"
+                    aria-label="Payment method"
+                  >
+                    <option>Venmo</option>
+                    <option>Zelle</option>
+                    <option>Cash</option>
+                    <option>PayPal</option>
+                    <option>Bank transfer</option>
+                  </select>
+                  <input
+                    value={settleNote}
+                    onChange={(e) => setSettleNote(e.target.value)}
+                    placeholder="Note (optional)"
+                    className="bg-slate-950 border border-slate-800 rounded-lg p-2 text-sm"
+                  />
+                </div>
+                <button
+                  onClick={recordFullSettlement}
+                  disabled={saving}
+                  className="w-full flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-white font-semibold py-2.5 rounded-lg text-sm"
+                >
+                  <HandCoins className="w-4 h-4" />
+                  Record payment of {money(ledger.amount)}
+                </button>
+              </>
+            ) : (
+              <div className="flex items-center gap-2 text-sm">
+                <CheckCircle2 className="w-5 h-5 text-emerald-400" />
+                <span className="font-semibold">All settled up</span>
+                <span className="text-slate-400">— nobody owes anything right now.</span>
+              </div>
+            )}
+            {!showOtherAmount ? (
+              <button onClick={openOtherAmount} className="text-xs text-emerald-400 font-medium">
+                Record a different amount…
+              </button>
+            ) : (
+              <form onSubmit={handleSettleSubmit} className="border-t border-slate-800 pt-3 space-y-2">
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="text-xs text-slate-400">Who paid</label>
+                    <select
+                      value={settleFrom}
+                      onChange={(e) => setSettleFrom(e.target.value)}
+                      className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-sm mt-1"
+                    >
+                      {users.map((u) => (
+                        <option key={u.id} value={u.id}>
+                          {u.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs text-slate-400">Paid to</label>
+                    <select
+                      value={settleTo}
+                      onChange={(e) => setSettleTo(e.target.value)}
+                      className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-sm mt-1"
+                    >
+                      {users.map((u) => (
+                        <option key={u.id} value={u.id}>
+                          {u.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <input
+                    type="number"
+                    step="0.01"
+                    min="0.01"
+                    placeholder="Amount ($)"
+                    value={settleAmount}
+                    onChange={(e) => setSettleAmount(e.target.value)}
+                    className="bg-slate-950 border border-slate-800 rounded-lg p-2 text-sm"
+                    required
+                  />
+                  <button
+                    type="submit"
+                    disabled={saving}
+                    className="bg-slate-800 hover:bg-slate-700 disabled:opacity-60 text-white font-semibold rounded-lg text-sm"
+                  >
+                    Save payment
+                  </button>
+                </div>
+                <p className="text-[11px] text-slate-500">
+                  Uses the method and note above. A payment only closes the period when it brings the balance to $0.
+                </p>
+              </form>
+            )}
+          </div>
+
+          {/* 2. This period, per person */}
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-4">
-            <h3 className="text-sm font-semibold mb-3">Money Contributed (after payments)</h3>
+            <h3 className="text-sm font-semibold mb-3">Since the last settle-up</h3>
             <div className="grid grid-cols-2 gap-3">
-              {contributions.map((c) => (
-                <div key={c.user.id} className="bg-slate-950 border border-slate-800 rounded-lg p-3 text-xs space-y-1">
-                  <p className="text-sm font-semibold">{c.user.name}</p>
+              {wallet.summary.map((c) => (
+                <div key={c.userId} className="bg-slate-950 border border-slate-800 rounded-lg p-3 text-xs space-y-1">
+                  <p className="text-sm font-semibold">{userName(c.userId)}</p>
                   <p className="flex justify-between text-slate-400">
-                    <span>Spools bought</span>
-                    <span>{money(c.spoolSpend)}</span>
+                    <span>Bought (own wallet)</span>
+                    <span>{money(c.boughtSpools + c.boughtParts)}</span>
                   </p>
                   <p className="flex justify-between text-slate-400">
-                    <span>Parts bought</span>
-                    <span>{money(c.partsSpend)}</span>
+                    <span>Used own filament</span>
+                    <span>{money(c.usedOwn)}</span>
+                  </p>
+                  <p className="flex justify-between text-slate-300">
+                    <span>Used other's filament</span>
+                    <span>{money(c.usedOther)}</span>
+                  </p>
+                  <p className="flex justify-between text-slate-300">
+                    <span>Share of other's parts</span>
+                    <span>{money(c.partsShareOwed)}</span>
                   </p>
                   <p className="flex justify-between text-slate-400">
-                    <span>+ Paid to other</span>
-                    <span>{money(c.sent)}</span>
-                  </p>
-                  <p className="flex justify-between text-slate-400">
-                    <span>− Received</span>
-                    <span>{money(c.received)}</span>
-                  </p>
-                  <p className="flex justify-between border-t border-slate-800 pt-1 font-semibold text-emerald-400">
-                    <span>Net contributed</span>
-                    <span>{money(c.net)}</span>
+                    <span>Paid / received</span>
+                    <span>
+                      {money(c.sent)} / {money(c.received)}
+                    </span>
                   </p>
                 </div>
               ))}
             </div>
           </div>
 
-          {ledger.debtorId && (
-            <button
-              onClick={prefillFullSettlement}
-              className="w-full flex items-center justify-center gap-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-100 font-semibold py-2.5 rounded-lg text-sm"
-            >
-              <HandCoins className="w-4 h-4 text-emerald-400" />
-              Fill in full balance: {ledger.text} {money(ledger.amount)}
-            </button>
-          )}
-
-          <form
-            onSubmit={handleSettleSubmit}
-            className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3"
-          >
-            <h3 className="text-sm font-semibold">Record a Payment (Venmo / Zelle / Cash)</h3>
-            <div className="grid grid-cols-2 gap-2">
-              <div>
-                <label className="text-xs text-slate-400">Who paid</label>
-                <select
-                  value={settleFrom}
-                  onChange={(e) => setSettleFrom(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-sm mt-1"
-                >
-                  {users.map((u) => (
-                    <option key={u.id} value={u.id}>
-                      {u.name}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div>
-                <label className="text-xs text-slate-400">Paid to</label>
-                <select
-                  value={settleTo}
-                  onChange={(e) => setSettleTo(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-sm mt-1"
-                >
-                  {users.map((u) => (
-                    <option key={u.id} value={u.id}>
-                      {u.name}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            </div>
-            <div className="grid grid-cols-2 gap-2">
-              <input
-                type="number"
-                step="0.01"
-                min="0.01"
-                placeholder="Amount ($)"
-                value={settleAmount}
-                onChange={(e) => setSettleAmount(e.target.value)}
-                className="bg-slate-950 border border-slate-800 rounded-lg p-2 text-sm"
-                required
-              />
-              <select
-                value={settleMethod}
-                onChange={(e) => setSettleMethod(e.target.value)}
-                className="bg-slate-950 border border-slate-800 rounded-lg p-2 text-sm"
-              >
-                <option>Venmo</option>
-                <option>Zelle</option>
-                <option>Cash</option>
-                <option>PayPal</option>
-                <option>Bank transfer</option>
-              </select>
-            </div>
-            <input
-              value={settleNote}
-              onChange={(e) => setSettleNote(e.target.value)}
-              placeholder="Note (optional)"
-              className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-sm"
-            />
-            <button
-              type="submit"
-              disabled={saving}
-              className="w-full bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-white font-semibold py-2.5 rounded-lg text-sm"
-            >
-              Save Payment
-            </button>
-          </form>
-
-          <div className="space-y-2">
-            <h3 className="text-sm font-semibold">Payment History</h3>
-            {settlements.length === 0 ? (
-              <p className="text-xs text-slate-400">No payments recorded yet.</p>
-            ) : (
-              settlements.map((st) => (
-                <div
-                  key={st.id}
-                  className="bg-slate-900 border border-slate-800 rounded-xl p-3 flex items-center justify-between"
-                >
-                  <div>
-                    <p className="text-sm">
-                      <span className="font-semibold">{userName(st.from_user_id)}</span>
-                      <span className="text-slate-400"> paid </span>
-                      <span className="font-semibold">{userName(st.to_user_id)}</span>
-                    </p>
-                    <p className="text-xs text-slate-400 mt-0.5">
-                      {st.method} • {new Date(st.settled_at).toLocaleDateString()}
-                      {st.note ? ` • ${st.note}` : ''}
-                    </p>
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <span className="text-sm font-bold text-emerald-400">{money(Number(st.amount))}</span>
-                    <button
-                      onClick={() => deleteSettlement(st)}
-                      className="text-slate-500 hover:text-rose-400 p-1"
-                      title="Delete payment"
-                    >
-                      <Trash2 className="w-4 h-4" />
-                    </button>
-                  </div>
+          {/* 3. Full history, grouped by settle-up */}
+          <div className="space-y-4">
+            <h3 className="text-sm font-semibold">History</h3>
+            {wallet.periods.every((pd) => pd.entries.length === 0) && (
+              <p className="text-xs text-slate-400">Nothing yet. Purchases, prints and payments will show up here.</p>
+            )}
+            {wallet.periods.map((period, pi) =>
+              period.entries.length === 0 ? null : (
+                <div key={period.closedBy?.id || 'open'} className="space-y-2">
+                  <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">
+                    {period.closedBy
+                      ? `Settled on ${new Date(period.closedBy.settled_at).toLocaleDateString()} — ${userName(
+                          period.closedBy.from_user_id
+                        )} paid ${userName(period.closedBy.to_user_id)} ${money(Number(period.closedBy.amount))}`
+                      : pi === 0
+                        ? 'Current period (not settled yet)'
+                        : ''}
+                  </p>
+                  {[...period.entries].reverse().map((e) => {
+                    const badge = entryBadge(e);
+                    const Icon =
+                      e.kind === 'print' ? Printer : e.kind === 'part' ? Wrench : e.kind === 'payment' ? HandCoins : Disc;
+                    const st = e.settlementId ? settlements.find((x) => x.id === e.settlementId) : undefined;
+                    const pr = e.printId ? prints.find((x) => x.id === e.printId) : undefined;
+                    return (
+                      <div
+                        key={e.key}
+                        className="bg-slate-900 border border-slate-800 rounded-xl p-3 flex items-start justify-between gap-3"
+                      >
+                        <div className="flex items-start gap-2.5 min-w-0">
+                          <Icon className="w-4 h-4 text-slate-400 mt-0.5 shrink-0" />
+                          <div className="min-w-0">
+                            <p className="text-sm font-medium">{e.title}</p>
+                            {e.detail && <p className="text-xs text-slate-400 mt-0.5">{e.detail}</p>}
+                            <p className="text-[11px] text-slate-500 mt-0.5">
+                              {new Date(e.when).toLocaleDateString()}
+                              {e.kind !== 'payment' && e.amount != null && e.amount > 0 ? ` • ${money(e.amount)}` : ''}
+                              {' • after: '}
+                              {runningLabel(e.runningBalance)}
+                            </p>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2 shrink-0">
+                          <span
+                            className={`text-[11px] font-semibold px-2 py-0.5 rounded-full ${
+                              badge.tone === 'pay'
+                                ? 'bg-emerald-500/15 text-emerald-300'
+                                : badge.tone === 'owe'
+                                  ? 'bg-amber-500/15 text-amber-300'
+                                  : 'bg-slate-800 text-slate-400'
+                            }`}
+                          >
+                            {badge.text}
+                          </span>
+                          {(st || pr) && (
+                            <button
+                              onClick={() => (st ? deleteSettlement(st) : deletePrint(pr!))}
+                              className="text-slate-500 hover:text-rose-400 p-1"
+                              title={st ? 'Delete payment' : 'Delete print'}
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
-              ))
+              )
             )}
           </div>
         </div>
