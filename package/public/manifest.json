@@ -1,9 +1,0 @@
-{
-  "name": "SpoolSplit — Fini & Mike",
-  "short_name": "SpoolSplit",
-  "description": "Shared Bambu Lab 3D Printer Filament & Cost Splitter",
-  "start_url": "/",
-  "display": "standalone",
-  "background_color": "#020617",
-  "theme_color": "#059669"
-}
