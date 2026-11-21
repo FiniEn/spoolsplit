@@ -23,7 +23,6 @@ export async function POST(request: Request) {
         material: s.material,
         color_name: s.color_name,
         color_hex: s.color_hex,
-        remaining_weight_g: s.remaining_weight_g,
       }))
     );
 

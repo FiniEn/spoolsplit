@@ -360,24 +360,6 @@ export default function SpoolSplitApp() {
   const updateUsage = (idx: number, patch: Partial<UsageDraft>) =>
     setUsages((prev) => prev.map((u, i) => (i === idx ? { ...u, ...patch } : u)));
 
-  /** Adds (positive) or removes (negative) grams on each spool, clamped to [0, initial]. */
-  const adjustSpoolWeights = async (gramsBySpool: Map<string, number>) => {
-    for (const [spoolId, delta] of gramsBySpool) {
-      const spool = allSpools.find((s) => s.id === spoolId);
-      if (!spool) continue;
-      const next = Math.min(
-        Number(spool.initial_weight_g),
-        Math.max(0, Number(spool.remaining_weight_g) + delta)
-      );
-      check(
-        await supabase
-          .from('spools')
-          .update({ remaining_weight_g: Number(next.toFixed(2)) })
-          .eq('id', spoolId)
-      );
-    }
-  };
-
   const resetPrintForm = () => {
     setPrintTitle('');
     setPrintNoteOrUrl('');
@@ -397,15 +379,12 @@ export default function SpoolSplitApp() {
 
       let totalGrams = 0;
       let totalCost = 0;
-      const gramsBySpool = new Map<string, number>();
-
       const preparedUsages = usages.map((u) => {
         const spool = allSpools.find((s) => s.id === u.spool_id)!;
         const grams = Number(u.grams_used);
         const cost = grams * Number(spool.cost_per_gram || 0);
         totalGrams += grams;
         totalCost += cost;
-        gramsBySpool.set(u.spool_id, (gramsBySpool.get(u.spool_id) || 0) - grams);
         return {
           spool_id: u.spool_id,
           grams_used: grams,
@@ -441,8 +420,6 @@ export default function SpoolSplitApp() {
           throw new Error(usageRes.error.message);
         }
 
-        await adjustSpoolWeights(gramsBySpool);
-
         resetPrintForm();
         setShowPrintModal(false);
         await fetchAllData();
@@ -453,14 +430,9 @@ export default function SpoolSplitApp() {
 
   const deletePrint = (print: PrintJob) =>
     run(async () => {
-      if (!confirm(`Delete "${print.title}"? The filament will be put back on its spools.`)) return;
-      const gramsBySpool = new Map<string, number>();
-      (print.print_spool_usages || []).forEach((u) => {
-        gramsBySpool.set(u.spool_id, (gramsBySpool.get(u.spool_id) || 0) + Number(u.grams_used));
-      });
+      if (!confirm(`Delete "${print.title}"? Its cost will be removed from the balance.`)) return;
       check(await supabase.from('print_spool_usages').delete().eq('print_id', print.id));
       check(await supabase.from('prints').delete().eq('id', print.id));
-      await adjustSpoolWeights(gramsBySpool);
       await fetchAllData();
     });
 
@@ -719,13 +691,9 @@ export default function SpoolSplitApp() {
             </div>
           )}
           {spools.map((s) => {
-            const pct = Math.max(
-              0,
-              Math.min(100, (Number(s.remaining_weight_g) / Number(s.initial_weight_g)) * 100)
-            );
             return (
               <div key={s.id} className="bg-slate-900 border border-slate-800 rounded-xl p-4">
-                <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2.5">
                     <span
                       className="w-4 h-4 rounded-full border border-white/20"
@@ -743,19 +711,16 @@ export default function SpoolSplitApp() {
                   </div>
                   <div className="flex items-center gap-2">
                     <span className="text-xs font-mono text-slate-300">
-                      {Number(s.remaining_weight_g).toFixed(0)}g / {Number(s.initial_weight_g).toFixed(0)}g
+                      {Number(s.initial_weight_g).toFixed(0)}g spool
                     </span>
                     <button
                       onClick={() => archiveSpool(s.id)}
                       className="text-slate-500 hover:text-amber-300 p-1"
-                      title="Archive spool (used up). It still counts toward the balance."
+                      title="Archive spool (hides it from the list; it still counts toward the balance)"
                     >
                       <Archive className="w-4 h-4" />
                     </button>
                   </div>
-                </div>
-                <div className="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
-                  <div className="h-full bg-emerald-500 transition-all" style={{ width: `${pct}%` }} />
                 </div>
               </div>
             );
@@ -1142,7 +1107,7 @@ export default function SpoolSplitApp() {
                   >
                     {spools.map((s) => (
                       <option key={s.id} value={s.id}>
-                        {s.color_name} ({s.material}) — {Number(s.remaining_weight_g).toFixed(0)}g left
+                        {s.color_name} ({s.material}) — paid by {userName(s.paid_by_user_id)}
                       </option>
                     ))}
                   </select>
@@ -1177,7 +1142,7 @@ export default function SpoolSplitApp() {
               disabled={saving}
               className="w-full bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-white font-semibold py-3 rounded-xl text-sm"
             >
-              Save Print & Deduct Filament
+              Save Print
             </button>
           </div>
         </div>
