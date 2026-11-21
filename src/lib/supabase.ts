@@ -3,7 +3,14 @@ import { createClient } from '@supabase/supabase-js';
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
 
-export const supabase = createClient(supabaseUrl, supabaseAnonKey);
+/** False when the Supabase env vars were missing at build time (e.g. not enabled for Vercel Preview). */
+export const supabaseConfigured = Boolean(supabaseUrl && supabaseAnonKey);
+
+// Fall back to a dummy client so the build doesn't crash; the page shows a clear message instead.
+export const supabase = createClient(
+  supabaseUrl || 'https://supabase-not-configured.invalid',
+  supabaseAnonKey || 'missing-anon-key'
+);
 
 export interface User {
   id: string;
