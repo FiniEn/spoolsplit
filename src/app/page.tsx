@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useEffect, useState, useMemo } from 'react';
-import { supabase, supabaseConfigured, missingSupabaseVars, User, Spool, PrintJob, Settlement } from '@/lib/supabase';
+import { supabase, supabaseConfigured, missingSupabaseVars, User, PrintSpoolUsage, Spool, PrintJob, Settlement } from '@/lib/supabase';
 import {
   Disc,
   Printer,
@@ -124,13 +124,16 @@ export default function SpoolSplitApp() {
         )}. Check the variable names in Vercel (Settings → Environment Variables), then redeploy.`
       );
     }
-    const [u, s, p, st] = await Promise.all([
+    // Prints and their filament rows are loaded separately and joined here, so this works even if
+    // the database has no foreign key between print_spool_usages.print_id and prints.id.
+    const [u, s, p, pu, st] = await Promise.all([
       supabase.from('users').select('*').order('name'),
       supabase.from('spools').select('*').order('created_at', { ascending: false }),
-      supabase.from('prints').select('*, print_spool_usages(*)').order('created_at', { ascending: false }),
+      supabase.from('prints').select('*').order('created_at', { ascending: false }),
+      supabase.from('print_spool_usages').select('*'),
       supabase.from('settlements').select('*').order('settled_at', { ascending: false }),
     ]);
-    const firstError = [u, s, p, st].find((r) => r.error)?.error;
+    const firstError = [u, s, p, pu, st].find((r) => r.error)?.error;
     if (firstError) throw new Error(`Could not load data: ${firstError.message}`);
 
     const userRows = (u.data || []) as User[];
@@ -145,7 +148,19 @@ export default function SpoolSplitApp() {
       }
     }
     setAllSpools((s.data || []) as Spool[]);
-    setPrints((p.data || []) as PrintJob[]);
+    const usagesByPrint = new Map<string, PrintSpoolUsage[]>();
+    ((pu.data || []) as PrintSpoolUsage[]).forEach((row) => {
+      if (!row.print_id) return;
+      const list = usagesByPrint.get(row.print_id) || [];
+      list.push(row);
+      usagesByPrint.set(row.print_id, list);
+    });
+    setPrints(
+      ((p.data || []) as PrintJob[]).map((pr) => ({
+        ...pr,
+        print_spool_usages: usagesByPrint.get(pr.id) || [],
+      }))
+    );
     setSettlements((st.data || []) as Settlement[]);
   };
 
