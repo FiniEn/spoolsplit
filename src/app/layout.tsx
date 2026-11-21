@@ -5,13 +5,13 @@ export const metadata: Metadata = {
   title: 'SpoolSplit — Fini & Mike',
   description: 'Shared Bambu Lab Filament & Cost Tracker',
   manifest: '/manifest.json',
+  icons: { icon: '/icon.svg', apple: '/icon.svg' },
 };
 
 export const viewport: Viewport = {
   themeColor: '#020617',
   width: 'device-width',
   initialScale: 1,
-  maximumScale: 1,
 };
 
 export default function RootLayout({

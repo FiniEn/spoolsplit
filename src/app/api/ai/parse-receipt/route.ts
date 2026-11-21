@@ -4,6 +4,16 @@ import { GoogleGenAI, Type } from '@google/genai';
 export async function POST(request: Request) {
   try {
     const { fileBase64, mimeType, rawText } = await request.json();
+    if (!process.env.GEMINI_API_KEY) {
+      return NextResponse.json({ error: 'GEMINI_API_KEY is not configured on the server' }, { status: 500 });
+    }
+    if (!fileBase64 && !rawText) {
+      return NextResponse.json({ error: 'Provide a file or some text to parse' }, { status: 400 });
+    }
+    // ~10 MB of base64 is plenty for a screenshot or receipt PDF
+    if (fileBase64 && fileBase64.length > 14_000_000) {
+      return NextResponse.json({ error: 'File is too large (max ~10 MB)' }, { status: 413 });
+    }
     const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
     const parts: any[] = [
