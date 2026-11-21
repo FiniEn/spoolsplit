@@ -5,6 +5,11 @@ const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
 
 /** False when the Supabase env vars were missing at build time (e.g. not enabled for Vercel Preview). */
 export const supabaseConfigured = Boolean(supabaseUrl && supabaseAnonKey);
+export const missingSupabaseVars = [
+  !supabaseUrl && 'the Supabase URL (NEXT_PUBLIC_SUPABASE_URL or SUPABASE_URL)',
+  !supabaseAnonKey &&
+    'the Supabase anon/publishable key (NEXT_PUBLIC_SUPABASE_ANON_KEY or NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY)',
+].filter(Boolean) as string[];
 
 // Fall back to a dummy client so the build doesn't crash; the page shows a clear message instead.
 export const supabase = createClient(

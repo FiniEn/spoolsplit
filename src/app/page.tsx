@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useEffect, useState, useMemo } from 'react';
-import { supabase, supabaseConfigured, User, Spool, PrintJob, Settlement } from '@/lib/supabase';
+import { supabase, supabaseConfigured, missingSupabaseVars, User, Spool, PrintJob, Settlement } from '@/lib/supabase';
 import {
   Disc,
   Printer,
@@ -119,7 +119,9 @@ export default function SpoolSplitApp() {
   const fetchAllData = async () => {
     if (!supabaseConfigured) {
       throw new Error(
-        'Supabase is not configured: NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY were not set when this version was built. In Vercel, enable them for this environment and redeploy.'
+        `Supabase is not configured. Missing when this version was built: ${missingSupabaseVars.join(
+          ' and '
+        )}. Check the variable names in Vercel (Settings → Environment Variables), then redeploy.`
       );
     }
     const [u, s, p, st] = await Promise.all([
