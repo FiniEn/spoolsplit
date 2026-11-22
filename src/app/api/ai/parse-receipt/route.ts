@@ -20,7 +20,7 @@ export async function POST(request: Request) {
       {
         text: `You are an expert 3D printing invoice parser. Extract every item from this receipt into two lists:
         - 'spools': filament spools/refills.
-        - 'parts': everything else bought for the printer — nozzles, hotends, PTFE tubes, build plates, AMS parts, and maintenance items (lubricant, cleaning, desiccant, etc.). Use category 'other' if unsure. Do NOT list tax, shipping, discounts or gift cards as parts.
+        - 'parts': EVERY other item on the receipt, one entry per product line — printer parts (nozzles, hotends, PTFE tubes, build plates, AMS parts), maintenance items (lubricant, cleaning, desiccant), and anything else (tools, magnets, glue, accessories, personal items). Use category 'other' for anything that isn't a printer part or maintenance item. Do NOT list tax, shipping, discounts or gift cards as items.
         Proportionally distribute any tax, shipping, and discounts across ALL items (spools and parts) so 'unit_landed_cost' reflects the true out-of-pocket cost of ONE unit.
         If a line item has quantity > 1, return the 'unit_landed_cost' for ONE unit and set 'quantity' accordingly.
         For spools, estimate a 6-character hex code (e.g. #FFFFFF) for 'estimated_color_hex' based on the filament color name.

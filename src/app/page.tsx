@@ -12,11 +12,13 @@ import {
   Settlement,
   Part,
   PartCategory,
+  ReceiptRecord,
+  SplitMode,
   PART_CATEGORIES,
   PART_CATEGORY_LABELS,
 } from '@/lib/supabase';
 import { formatMinutes, printMinutesByUser } from '@/lib/split';
-import { computeWallet, WalletEntry } from '@/lib/wallet';
+import { computeWallet, manualShares, WalletEntry } from '@/lib/wallet';
 import {
   Disc,
   Printer,
@@ -31,6 +33,9 @@ import {
   HandCoins,
   Wrench,
   CheckCircle2,
+  ChevronDown,
+  ExternalLink,
+  FileText,
 } from 'lucide-react';
 
 type StagedSpool = {
@@ -46,7 +51,99 @@ type StagedPart = {
   name: string;
   category: PartCategory;
   price: number | string;
+  split: SplitChoice;
 };
+
+/**
+ * How one receipt item is shared, as the picker shows it. Custom is stored as the first user's
+ * percentage here and converted to the buyer's share (payer_share) when saved.
+ */
+type SplitChoice = { mode: SplitMode; personalUserId: string | null; firstUserPct: number };
+const DEFAULT_SPLIT: SplitChoice = { mode: 'default', personalUserId: null, firstUserPct: 50 };
+
+/** Picker value → database columns for a part bought by `payerId`. */
+function splitToColumns(split: SplitChoice, payerId: string, users: User[]) {
+  const firstIsPayer = users[0]?.id === payerId;
+  const pct = Math.min(100, Math.max(0, Number(split.firstUserPct) || 0)) / 100;
+  return {
+    split_mode: split.mode,
+    personal_user_id: split.mode === 'personal' ? split.personalUserId : null,
+    payer_share: split.mode === 'custom' ? Number((firstIsPayer ? pct : 1 - pct).toFixed(4)) : null,
+  };
+}
+
+/** Database columns → picker value. */
+function columnsToSplit(part: Part, users: User[]): SplitChoice {
+  const mode = part.split_mode || 'default';
+  let firstUserPct = 50;
+  if (mode === 'custom' && part.payer_share != null) {
+    const payerShare = Number(part.payer_share);
+    firstUserPct = Math.round((users[0]?.id === part.paid_by_user_id ? payerShare : 1 - payerShare) * 100);
+  }
+  return { mode, personalUserId: part.personal_user_id || null, firstUserPct };
+}
+
+/** Dropdown (+ percentage box for custom) to choose how one item is shared. */
+function SplitPicker({
+  value,
+  users,
+  onChange,
+  compact,
+}: {
+  value: SplitChoice;
+  users: User[];
+  onChange: (next: SplitChoice) => void;
+  compact?: boolean;
+}) {
+  const selectValue = value.mode === 'personal' ? `personal:${value.personalUserId}` : value.mode;
+  const [pctDraft, setPctDraft] = useState(String(value.firstUserPct));
+  useEffect(() => setPctDraft(String(value.firstUserPct)), [value.firstUserPct]);
+  const commitPct = () => {
+    const n = Math.min(100, Math.max(0, Math.round(Number(pctDraft) || 0)));
+    setPctDraft(String(n));
+    if (n !== value.firstUserPct) onChange({ ...value, firstUserPct: n });
+  };
+  return (
+    <div className="flex items-center gap-1.5 min-w-0">
+      <select
+        value={selectValue}
+        onChange={(e) => {
+          const v = e.target.value;
+          if (v.startsWith('personal:')) onChange({ ...value, mode: 'personal', personalUserId: v.slice(9) });
+          else onChange({ ...value, mode: v as SplitMode });
+        }}
+        className={`bg-slate-900 border border-slate-800 rounded p-1.5 min-w-0 ${compact ? 'text-[11px]' : 'text-xs'}`}
+        aria-label="How to split this item"
+      >
+        <option value="default">By print time (default)</option>
+        <option value="even">Split 50/50</option>
+        {users.map((u) => (
+          <option key={u.id} value={`personal:${u.id}`}>
+            Only for {u.name}
+          </option>
+        ))}
+        <option value="custom">Custom %</option>
+      </select>
+      {value.mode === 'custom' && users.length >= 2 && (
+        <label className="flex items-center gap-1 text-[11px] text-slate-400 shrink-0">
+          {users[0].name}
+          <input
+            type="number"
+            min="0"
+            max="100"
+            value={pctDraft}
+            onChange={(e) => setPctDraft(e.target.value)}
+            onBlur={commitPct}
+            onKeyDown={(e) => e.key === 'Enter' && commitPct()}
+            className="w-12 bg-slate-900 border border-slate-800 rounded p-1"
+            aria-label={`${users[0].name}'s percentage`}
+          />
+          % / {users[1].name} {100 - (Math.min(100, Math.max(0, Number(pctDraft) || 0)))}%
+        </label>
+      )}
+    </div>
+  );
+}
 
 type UsageDraft = { spool_id: string; grams_used: number };
 
@@ -54,6 +151,7 @@ const newStagedPart = (overrides: Partial<StagedPart> = {}): StagedPart => ({
   name: '',
   category: 'nozzle',
   price: '',
+  split: DEFAULT_SPLIT,
   ...overrides,
 });
 
@@ -108,6 +206,8 @@ export default function SpoolSplitApp() {
   const [prints, setPrints] = useState<PrintJob[]>([]);
   const [settlements, setSettlements] = useState<Settlement[]>([]);
   const [parts, setParts] = useState<Part[]>([]);
+  const [receipts, setReceipts] = useState<ReceiptRecord[]>([]);
+  const [openReceiptId, setOpenReceiptId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'prints' | 'spools' | 'settle'>('prints');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -123,6 +223,9 @@ export default function SpoolSplitApp() {
   const [stagedSpools, setStagedSpools] = useState<StagedSpool[]>([]);
   const [stagedParts, setStagedParts] = useState<StagedPart[]>([]);
   const [receiptDate, setReceiptDate] = useState(todayIso());
+  const [receiptVendor, setReceiptVendor] = useState('');
+  const [receiptTotal, setReceiptTotal] = useState<number | null>(null);
+  const [receiptFile, setReceiptFile] = useState<File | null>(null);
 
   // Print Logger State
   const [printTitle, setPrintTitle] = useState('');
@@ -167,20 +270,26 @@ export default function SpoolSplitApp() {
     }
     // Prints and their filament rows are loaded separately and joined here, so this works even if
     // the database has no foreign key between print_spool_usages.print_id and prints.id.
-    const [u, s, p, pu, st, pa] = await Promise.all([
+    const [u, s, p, pu, st, pa, rc] = await Promise.all([
       supabase.from('users').select('*').order('name'),
       supabase.from('spools').select('*').order('created_at', { ascending: false }),
       supabase.from('prints').select('*').order('created_at', { ascending: false }),
       supabase.from('print_spool_usages').select('*'),
       supabase.from('settlements').select('*').order('settled_at', { ascending: false }),
       supabase.from('parts').select('*').order('purchased_at', { ascending: false }),
+      supabase.from('receipts').select('*').order('purchased_at', { ascending: false }),
     ]);
     if (pa.error && /parts/.test(pa.error.message)) {
       throw new Error(
         `Could not load data: the "parts" table is missing. Run supabase/add-parts.sql once in the Supabase SQL Editor. (${pa.error.message})`
       );
     }
-    const firstError = [u, s, p, pu, st, pa].find((r) => r.error)?.error;
+    if (rc.error && /receipts/.test(rc.error.message)) {
+      throw new Error(
+        `Could not load data: the "receipts" table is missing. Run supabase/add-receipts.sql once in the Supabase SQL Editor. (${rc.error.message})`
+      );
+    }
+    const firstError = [u, s, p, pu, st, pa, rc].find((r) => r.error)?.error;
     if (firstError) throw new Error(`Could not load data: ${firstError.message}`);
 
     const userRows = (u.data || []) as User[];
@@ -210,6 +319,7 @@ export default function SpoolSplitApp() {
     );
     setSettlements((st.data || []) as Settlement[]);
     setParts((pa.data || []) as Part[]);
+    setReceipts((rc.data || []) as ReceiptRecord[]);
   };
 
   useEffect(() => {
@@ -291,6 +401,9 @@ export default function SpoolSplitApp() {
         if (typeof data.order_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(data.order_date)) {
           setReceiptDate(data.order_date);
         }
+        if (file) setReceiptFile(file);
+        if (typeof data.vendor === 'string') setReceiptVendor(data.vendor);
+        setReceiptTotal(Number(data.grand_total) > 0 ? Number(data.grand_total) : null);
         const expandedParts: StagedPart[] = [];
         foundParts.forEach((pt: any) => {
           const qty = Math.max(1, Math.min(50, Number(pt.quantity) || 1));
@@ -359,37 +472,103 @@ export default function SpoolSplitApp() {
         const price = Number(pt.price);
         if (!pt.name.trim()) throw new Error('Every part needs a name');
         if (pt.price === '' || !(price >= 0)) throw new Error(`Part "${pt.name}" needs a valid price`);
+        if (pt.split.mode === 'personal' && !pt.split.personalUserId) throw new Error(`Pick who "${pt.name}" is for`);
         return {
           name: pt.name.trim(),
           category: pt.category,
           price: Number(price.toFixed(2)),
           paid_by_user_id: paidBy,
           purchased_at: receiptDate,
+          ...splitToColumns(pt.split, paidBy, users),
         };
       });
+      const itemsTotal =
+        spoolRows.reduce((sum, r) => sum + r.purchase_price, 0) + partRows.reduce((sum, r) => sum + r.price, 0);
       setSaving(true);
       try {
+        // 1. The receipt itself
+        const { data: receipt } = check(
+          await supabase
+            .from('receipts')
+            .insert({
+              vendor: receiptVendor.trim(),
+              purchased_at: receiptDate,
+              paid_by_user_id: paidBy,
+              total: Number((receiptTotal ?? itemsTotal).toFixed(2)),
+            })
+            .select()
+            .single()
+        );
+        const undo = async (spoolIds: string[]) => {
+          if (spoolIds.length > 0) await supabase.from('spools').delete().in('id', spoolIds);
+          await supabase.from('receipts').delete().eq('id', receipt.id);
+        };
+        // 2. The original file (optional: a failed upload doesn't lose the purchase)
+        let uploadWarning: string | null = null;
+        if (receiptFile) {
+          const ext = (receiptFile.name.split('.').pop() || 'bin').toLowerCase().replace(/[^a-z0-9]/g, '');
+          const path = `${receipt.id}.${ext}`;
+          const up = await supabase.storage.from('receipts').upload(path, receiptFile, {
+            contentType: receiptFile.type || undefined,
+            upsert: true,
+          });
+          if (up.error) uploadWarning = `Saved, but the receipt file could not be stored: ${up.error.message}`;
+          else await supabase.from('receipts').update({ file_path: path, file_type: receiptFile.type || null }).eq('id', receipt.id);
+        }
+        // 3. Its items
         let insertedSpoolIds: string[] = [];
         if (spoolRows.length > 0) {
-          const { data } = check(await supabase.from('spools').insert(spoolRows).select('id'));
-          insertedSpoolIds = (data || []).map((r: { id: string }) => r.id);
+          const res = await supabase
+            .from('spools')
+            .insert(spoolRows.map((r) => ({ ...r, receipt_id: receipt.id })))
+            .select('id');
+          if (res.error) {
+            await undo([]);
+            throw new Error(res.error.message);
+          }
+          insertedSpoolIds = (res.data || []).map((r: { id: string }) => r.id);
         }
         if (partRows.length > 0) {
-          const partRes = await supabase.from('parts').insert(partRows);
+          const partRes = await supabase.from('parts').insert(partRows.map((r) => ({ ...r, receipt_id: receipt.id })));
           if (partRes.error) {
-            // Keep the purchase all-or-nothing so a retry doesn't duplicate the spools
-            if (insertedSpoolIds.length > 0) await supabase.from('spools').delete().in('id', insertedSpoolIds);
+            // Keep the purchase all-or-nothing so a retry doesn't duplicate anything
+            await undo(insertedSpoolIds);
             throw new Error(partRes.error.message);
           }
         }
         setStagedSpools([]);
         setStagedParts([]);
         setReceiptText('');
+        setReceiptFile(null);
+        setReceiptVendor('');
+        setReceiptTotal(null);
+        if (uploadWarning) setErrorMsg(uploadWarning);
         setShowReceiptModal(false);
         await fetchAllData();
       } finally {
         setSaving(false);
       }
+    });
+
+  const updatePartSplit = (part: Part, split: SplitChoice) =>
+    run(async () => {
+      if (split.mode === 'personal' && !split.personalUserId) return;
+      check(await supabase.from('parts').update(splitToColumns(split, part.paid_by_user_id, users)).eq('id', part.id));
+      await fetchAllData();
+    });
+
+  const viewReceiptFile = (rec: ReceiptRecord) =>
+    run(async () => {
+      if (!rec.file_path) return;
+      // Open the tab right away (before awaiting) so phones don't block it as a pop-up
+      const win = window.open('', '_blank');
+      const { data, error } = await supabase.storage.from('receipts').createSignedUrl(rec.file_path, 60 * 10);
+      if (error || !data?.signedUrl) {
+        win?.close();
+        throw new Error(`Could not open the receipt file: ${error?.message || 'no link returned'}`);
+      }
+      if (win) win.location.href = data.signedUrl;
+      else window.location.href = data.signedUrl;
     });
 
   const deletePart = (part: Part) =>
@@ -733,6 +912,9 @@ export default function SpoolSplitApp() {
             setStagedSpools([newStagedSpool({ color_name: 'Jade White', color_hex: '#ffffff' })]);
             setStagedParts([]);
             setReceiptDate(todayIso());
+            setReceiptVendor('');
+            setReceiptTotal(null);
+            setReceiptFile(null);
             setShowReceiptModal(true);
           }}
           className="flex items-center justify-center gap-2 bg-slate-800 hover:bg-slate-700 text-slate-100 font-semibold py-3.5 px-4 rounded-xl border border-slate-700 transition"
@@ -746,7 +928,7 @@ export default function SpoolSplitApp() {
         {(
           [
             ['prints', `Print History (${prints.length})`],
-            ['spools', `Rack & Parts (${spools.length + parts.length})`],
+            ['spools', `Purchases (${receipts.length})`],
             ['settle', 'Wallet'],
           ] as const
         ).map(([key, label]) => (
@@ -807,6 +989,108 @@ export default function SpoolSplitApp() {
 
       {activeTab === 'spools' && (
         <div className="space-y-3">
+          {/* Receipts: every item on each bill, with how it's split */}
+          <div className="flex items-center gap-2">
+            <FileText className="w-4 h-4 text-emerald-400" />
+            <h3 className="text-sm font-semibold">Receipts</h3>
+          </div>
+          {receipts.length === 0 ? (
+            <div className="text-center py-6 bg-slate-900/40 rounded-xl border border-slate-800/80 p-4">
+              <p className="text-xs text-slate-400">
+                No receipts yet. Purchases you add with Scan Bill / Add Purchase are kept here with every item.
+              </p>
+            </div>
+          ) : (
+            receipts.map((rec) => {
+              const recSpools = allSpools.filter((sp) => sp.receipt_id === rec.id);
+              const recParts = parts.filter((pt) => pt.receipt_id === rec.id);
+              const isOpen = openReceiptId === rec.id;
+              const itemsTotal =
+                recSpools.reduce((sum, sp) => sum + Number(sp.purchase_price || 0), 0) +
+                recParts.reduce((sum, pt) => sum + Number(pt.price || 0), 0);
+              return (
+                <div key={rec.id} className="bg-slate-900 border border-slate-800 rounded-xl">
+                  <button
+                    onClick={() => setOpenReceiptId(isOpen ? null : rec.id)}
+                    className="w-full p-4 flex items-center justify-between gap-3 text-left"
+                    aria-expanded={isOpen}
+                  >
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold truncate">{rec.vendor || 'Receipt'}</p>
+                      <p className="text-xs text-slate-400 mt-0.5">
+                        {new Date(`${rec.purchased_at}T00:00:00`).toLocaleDateString()} • paid by{' '}
+                        {userName(rec.paid_by_user_id)} • {recSpools.length + recParts.length} item(s)
+                        {rec.file_path ? ' • file kept' : ''}
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <span className="text-sm font-bold text-emerald-400">{money(Number(rec.total))}</span>
+                      <ChevronDown className={`w-4 h-4 text-slate-400 transition ${isOpen ? 'rotate-180' : ''}`} />
+                    </div>
+                  </button>
+                  {isOpen && (
+                    <div className="border-t border-slate-800 p-3 space-y-2">
+                      {recSpools.map((sp) => (
+                        <div key={sp.id} className="bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-xs">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="flex items-center gap-2 min-w-0">
+                              <span
+                                className="w-3 h-3 rounded-full border border-white/20 shrink-0"
+                                style={{ backgroundColor: sp.color_hex }}
+                              />
+                              <span className="truncate">
+                                {sp.brand} {sp.material} — {sp.color_name} ({Number(sp.initial_weight_g).toFixed(0)} g)
+                              </span>
+                            </span>
+                            <span className="font-semibold shrink-0">{money(Number(sp.purchase_price))}</span>
+                          </div>
+                          <p className="text-[11px] text-slate-500 mt-1">Pay per use — each person pays for what they print</p>
+                        </div>
+                      ))}
+                      {recParts.map((pt) => (
+                        <div key={pt.id} className="bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-xs space-y-1.5">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="truncate">
+                              {pt.name}{' '}
+                              <span className="text-slate-500">({PART_CATEGORY_LABELS[pt.category] || pt.category})</span>
+                            </span>
+                            <span className="font-semibold shrink-0">{money(Number(pt.price))}</span>
+                          </div>
+                          <SplitPicker
+                            value={columnsToSplit(pt, users)}
+                            users={users}
+                            compact
+                            onChange={(split) => updatePartSplit(pt, split)}
+                          />
+                        </div>
+                      ))}
+                      {recSpools.length + recParts.length === 0 && (
+                        <p className="text-xs text-slate-400">The items on this receipt were deleted.</p>
+                      )}
+                      <div className="flex items-center justify-between pt-1">
+                        <span className="text-[11px] text-slate-500">
+                          Items {money(itemsTotal)} (tax & shipping spread over items)
+                        </span>
+                        {rec.file_path && (
+                          <button
+                            onClick={() => viewReceiptFile(rec)}
+                            className="flex items-center gap-1 text-xs text-emerald-400 font-medium"
+                          >
+                            <ExternalLink className="w-3.5 h-3.5" /> View original
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })
+          )}
+
+          <div className="flex items-center gap-2 pt-4">
+            <Disc className="w-4 h-4 text-emerald-400" />
+            <h3 className="text-sm font-semibold">Spool Rack</h3>
+          </div>
           {spools.length === 0 && (
             <div className="text-center py-12 bg-slate-900/40 rounded-2xl border border-slate-800/80 p-6">
               <p className="text-sm text-slate-400">No active spools. Add one with Scan Bill / Add Purchase.</p>
@@ -854,8 +1138,9 @@ export default function SpoolSplitApp() {
               <h3 className="text-sm font-semibold">Parts & Upkeep</h3>
             </div>
             <p className="text-xs text-slate-400">
-              Nozzles, tubes, plates and other parts are split by print time: each person pays their share of
-              the hours printed since the part was bought, until the next settle-up locks it. All-time print
+              By default, nozzles, tubes, plates and other parts are split by print time: each person pays their
+              share of the hours printed since the part was bought, until the next settle-up locks it. You can
+              change any item to 50/50, personal, or a custom %. All-time print
               time:{' '}
               {users
                 .map((u) => `${u.name} ${formatMinutes(printTimeTotals[u.id] || 0)}`)
@@ -888,8 +1173,18 @@ export default function SpoolSplitApp() {
                         Paid by {userName(pt.paid_by_user_id)} • {new Date(`${pt.purchased_at}T00:00:00`).toLocaleDateString()}
                       </p>
                       {users.length >= 2 && (
+                        <div className="mt-1.5">
+                          <SplitPicker
+                            value={columnsToSplit(pt, users)}
+                            users={users}
+                            compact
+                            onChange={(next) => updatePartSplit(pt, next)}
+                          />
+                        </div>
+                      )}
+                      {users.length >= 2 && (
                         <p className="text-xs text-slate-500 mt-0.5">
-                          {split?.frozen ? 'Split (locked at settle-up):' : 'Split so far:'}{' '}
+                          {split?.manual ? 'Split:' : split?.frozen ? 'Split (locked at settle-up):' : 'Split so far:'}{' '}
                           {users
                             .slice(0, 2)
                             .map((u) => `${u.name} ${Math.round((shares[u.id] || 0) * 100)}%`)
@@ -1215,8 +1510,24 @@ export default function SpoolSplitApp() {
                 />
               </div>
             </div>
+            <div className="grid grid-cols-2 gap-2">
+              <input
+                value={receiptVendor}
+                onChange={(e) => setReceiptVendor(e.target.value)}
+                placeholder="Store (e.g. Bambu Lab Store)"
+                className="bg-slate-950 border border-slate-800 rounded-lg p-2 text-sm"
+              />
+              <p className="text-[11px] text-slate-400 self-center flex items-center gap-1 min-w-0">
+                <FileText className="w-3.5 h-3.5 shrink-0" />
+                <span className="truncate">
+                  {receiptFile ? `File kept: ${receiptFile.name}` : 'No file — upload one above to keep it'}
+                </span>
+              </p>
+            </div>
 
-            <h3 className="text-xs font-semibold text-slate-300">Filament spools</h3>
+            <h3 className="text-xs font-semibold text-slate-300">
+              Filament spools <span className="font-normal text-slate-500">(pay per use — you pay for what you print)</span>
+            </h3>
             <div className="space-y-2 max-h-60 overflow-y-auto">
               {stagedSpools.map((sp, idx) => (
                 <div
@@ -1278,14 +1589,12 @@ export default function SpoolSplitApp() {
             <div className="space-y-2">
               <h3 className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
                 <Wrench className="w-3.5 h-3.5 text-emerald-400" />
-                Parts & upkeep <span className="font-normal text-slate-500">(split by print time)</span>
+                Parts & other items <span className="font-normal text-slate-500">(choose how each is split)</span>
               </h3>
               <div className="space-y-2 max-h-60 overflow-y-auto">
                 {stagedParts.map((pt, idx) => (
-                  <div
-                    key={idx}
-                    className="grid grid-cols-[2fr_1.3fr_1fr_auto] items-center gap-1.5 bg-slate-950 p-2 rounded-lg border border-slate-800 text-xs"
-                  >
+                  <div key={idx} className="bg-slate-950 p-2 rounded-lg border border-slate-800 text-xs space-y-1.5">
+                  <div className="grid grid-cols-[2fr_1.3fr_1fr_auto] items-center gap-1.5">
                     <input
                       value={pt.name}
                       onChange={(e) => updateStagedPart(idx, { name: e.target.value })}
@@ -1319,6 +1628,12 @@ export default function SpoolSplitApp() {
                     >
                       <X className="w-3.5 h-3.5" />
                     </button>
+                  </div>
+                  <SplitPicker
+                    value={pt.split}
+                    users={users}
+                    onChange={(split) => updateStagedPart(idx, { split })}
+                  />
                   </div>
                 ))}
               </div>

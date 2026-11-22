@@ -37,6 +37,7 @@ export interface Spool {
   is_shared_split: boolean;
   receipt_url?: string | null;
   is_archived: boolean;
+  receipt_id?: string | null;
   created_at: string;
 }
 
@@ -90,7 +91,7 @@ export const PART_CATEGORY_LABELS: Record<PartCategory, string> = {
   build_plate: 'Build plate',
   ams_part: 'AMS part',
   maintenance: 'Maintenance',
-  other: 'Other',
+  other: 'Other item',
 };
 
 /** A printer part or upkeep purchase. Its cost is split by each person's print time since purchase. */
@@ -101,6 +102,33 @@ export interface Part {
   price: number;
   paid_by_user_id: string;
   purchased_at: string; // YYYY-MM-DD
+  note?: string | null;
+  receipt_id?: string | null;
+  /** How the price is shared; missing on databases without add-receipts.sql (treated as 'default'). */
+  split_mode?: SplitMode;
+  personal_user_id?: string | null;
+  /** For 'custom': the share (0..1) the buyer covers; the other person owes the rest. */
+  payer_share?: number | null;
+  created_at: string;
+}
+
+/**
+ * default  = by print time since purchase (locked at the next settle-up)
+ * even     = 50/50
+ * personal = only for personal_user_id
+ * custom   = buyer covers payer_share, the other person the rest
+ */
+export type SplitMode = 'default' | 'even' | 'personal' | 'custom';
+
+/** A saved receipt: who paid, when, and the original file in the "receipts" storage bucket. */
+export interface ReceiptRecord {
+  id: string;
+  vendor: string;
+  purchased_at: string; // YYYY-MM-DD
+  paid_by_user_id: string;
+  total: number;
+  file_path?: string | null;
+  file_type?: string | null;
   note?: string | null;
   created_at: string;
 }

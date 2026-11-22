@@ -52,6 +52,8 @@ export interface PersonSummary {
 export interface PartSplitInfo {
   shares: Record<string, number>;
   frozen: boolean;
+  /** True when the split was chosen by hand (50/50, personal or custom). */
+  manual?: boolean;
 }
 
 export interface WalletResult {
@@ -185,7 +187,19 @@ export function computeWallet(input: {
         amount: Number(part.price || 0),
         partId: part.id,
       };
-      open.push({ part, minutes: { [A]: 0, [B]: 0 }, entry });
+      const manual = manualShares(part, A, B, name);
+      if (manual) {
+        // Split chosen by hand: charged in full right away, print time doesn't matter.
+        const value = partValue(part, manual.shares);
+        entry.delta = value;
+        entry.detail = `${money(Number(part.price))} • ${manual.label}`;
+        fixed += value;
+        partSplit.set(part.id, { shares: manual.shares, frozen: true, manual: true });
+        const other = part.paid_by_user_id === A ? B : part.paid_by_user_id === B ? A : '';
+        if (other) summary[other].partsShareOwed += Number(part.price || 0) * manual.shares[other];
+      } else {
+        open.push({ part, minutes: { [A]: 0, [B]: 0 }, entry });
+      }
       current.push(entry);
     } else if (ev.kind === 'print') {
       const p = ev.print;
@@ -292,6 +306,38 @@ export function computeWallet(input: {
     partSplit,
     summary: [summary[A], summary[B]],
   };
+}
+
+/**
+ * Shares (0..1 per user) for a part whose split was chosen by hand, or null for the default
+ * print-time split. `name` is only used to build the label.
+ */
+export function manualShares(
+  part: Pick<Part, 'split_mode' | 'personal_user_id' | 'payer_share' | 'paid_by_user_id'>,
+  A: string,
+  B: string,
+  name: (id: string) => string = (id) => id
+): { shares: Record<string, number>; label: string } | null {
+  const mode = part.split_mode || 'default';
+  if (mode === 'even') return { shares: { [A]: 0.5, [B]: 0.5 }, label: 'split 50/50' };
+  if (mode === 'personal' && (part.personal_user_id === A || part.personal_user_id === B)) {
+    const who = part.personal_user_id;
+    return {
+      shares: { [A]: who === A ? 1 : 0, [B]: who === B ? 1 : 0 },
+      label: `only for ${name(who)} (personal)`,
+    };
+  }
+  if (mode === 'custom' && part.payer_share != null && (part.paid_by_user_id === A || part.paid_by_user_id === B)) {
+    const payerShare = Math.min(1, Math.max(0, Number(part.payer_share)));
+    const payer = part.paid_by_user_id;
+    const other = payer === A ? B : A;
+    const shares = { [payer]: payerShare, [other]: 1 - payerShare };
+    return {
+      shares,
+      label: `custom split: ${name(A)} ${Math.round(shares[A] * 100)}% / ${name(B)} ${Math.round(shares[B] * 100)}%`,
+    };
+  }
+  return null;
 }
 
 function newSummary(userId: string): PersonSummary {

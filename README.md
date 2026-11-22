@@ -7,12 +7,13 @@ A small web app for two people sharing a Bambu Lab 3D printer. It tracks what ea
 - **Parts split by print time:** each part's price is shared in proportion to the hours each person printed since it was bought. Shared prints count half each, and the split is 50/50 until someone prints.
 - **Wallet model:** whoever buys a spool or part pays from their own wallet. You owe the other person only for what you use of *their* purchases. Using your own costs nothing, and shared prints split half each. Everything nets out to **at most one payment** between you.
 - **Settle up:** the Wallet tab shows the one payment that settles everything ("Fini pays Mike $8.67"). Recording it closes the period, which also locks the print-time split of any parts bought before it. You can still record partial payments.
+- **Receipts:** every saved purchase keeps its full item list and the original image or PDF ("View original"), under **Purchases → Receipts**. Spools are always pay-per-use. Every other item can be split **by print time** (the default), **50/50**, **only for Fini / Mike** (personal), or a **custom %**, when you add it or any time later. A manual split is charged right away instead of waiting for print time.
 - **History:** every purchase, print, part and payment is listed with what it changed and the balance after it, grouped by settle-up.
 - **CSV export** of the full wallet history.
 
 ## Setup
 
-1. Create a Supabase project and run `supabase/schema.sql` in its SQL editor. If your database was set up before parts existed, run `supabase/add-parts.sql` once instead. This creates the tables and the two users; edit the names in the last statement.
+1. Create a Supabase project and run `supabase/schema.sql` in its SQL editor. Then run `supabase/add-receipts.sql`, which adds receipts, per-item splits and the private `receipts` storage bucket for the files. If your database was set up before parts existed, run `supabase/add-parts.sql` first. This creates the tables and the two users; edit the names in the last statement.
 2. Copy `.env.example` to `.env.local` and fill in your Supabase URL, anon key, and Gemini API key.
 3. Run `npm install`, then `npm run dev`.
 
