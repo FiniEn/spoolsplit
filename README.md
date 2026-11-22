@@ -17,6 +17,9 @@ A small web app for two people sharing a Bambu Lab 3D printer. It tracks what ea
 2. Copy `.env.example` to `.env.local` and fill in your Supabase URL, anon key, and Gemini API key.
 3. Run `npm install`, then `npm run dev`.
 
-## Security note
+## Security
 
-There is no login. The app talks to Supabase from the browser with the anon key, and the schema's row-level-security policies allow full access to anyone who has that key. The `/api/ai/*` routes are also open, so anyone with the URL can use your Gemini quota. Keep the deployment URL private, or add Supabase Auth and tighten the policies.
+- **PIN lock:** the whole app is locked behind `WORKSPACE_PIN`. That covers the pages, the app's JavaScript (which contains the Supabase key) and the Gemini routes. It is checked on the server, so the app won't open without it.
+- **Staying unlocked:** a correct PIN keeps that device unlocked for 180 days. The 🔒 button locks it again, and changing `WORKSPACE_PIN` locks every device.
+- **Wrong PINs:** each wrong PIN takes a second to answer, and 5 wrong tries lock that IP address out for 15 minutes. Use 6 or more digits.
+- **Known limit:** the database rules still allow anyone who has the Supabase anon key. The key is now only delivered after the PIN, but anyone who unlocks the app can see it. For per-person access, add Supabase Auth and tighten the policies in `supabase/schema.sql`.

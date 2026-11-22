@@ -36,6 +36,7 @@ import {
   ChevronDown,
   ExternalLink,
   FileText,
+  Lock,
 } from 'lucide-react';
 
 type StagedSpool = {
@@ -833,6 +834,7 @@ export default function SpoolSplitApp() {
           </div>
         </div>
 
+        <div className="flex items-center gap-2">
         <div className="flex items-center bg-slate-900 p-1 rounded-xl border border-slate-800">
           {users.map((u) => (
             <button
@@ -851,6 +853,18 @@ export default function SpoolSplitApp() {
               {u.name}
             </button>
           ))}
+        </div>
+          <button
+            onClick={async () => {
+              await fetch('/api/pin', { method: 'DELETE' }).catch(() => undefined);
+              window.location.href = '/pin';
+            }}
+            className="p-2 rounded-xl bg-slate-900 border border-slate-800 text-slate-400 hover:text-slate-200"
+            title="Lock this device (asks for the PIN again)"
+            aria-label="Lock"
+          >
+            <Lock className="w-4 h-4" />
+          </button>
         </div>
       </header>
 
