@@ -19,6 +19,7 @@ import {
 } from '@/lib/supabase';
 import { formatMinutes, printMinutesByUser } from '@/lib/split';
 import { computeWallet, manualShares, WalletEntry } from '@/lib/wallet';
+import { INLINE_LIMIT_BYTES, fileExtension, formatBytes, shrinkImage } from '@/lib/upload';
 import {
   Disc,
   Printer,
@@ -194,6 +195,9 @@ async function callAi(path: string, body: unknown) {
     // fall through to the status check below
   }
   if (!res.ok || data?.error) {
+    if (res.status === 413 && !data?.error) {
+      throw new Error('That file is too large to send. Try a smaller photo or screenshot.');
+    }
     throw new Error(data?.error || `AI request failed (${res.status})`);
   }
   return data;
@@ -227,6 +231,8 @@ export default function SpoolSplitApp() {
   const [receiptVendor, setReceiptVendor] = useState('');
   const [receiptTotal, setReceiptTotal] = useState<number | null>(null);
   const [receiptFile, setReceiptFile] = useState<File | null>(null);
+  /** Set when a large receipt file was already put in storage for the AI to read. */
+  const [receiptStoragePath, setReceiptStoragePath] = useState<string | null>(null);
 
   // Print Logger State
   const [printTitle, setPrintTitle] = useState('');
@@ -385,13 +391,30 @@ export default function SpoolSplitApp() {
       try {
         let fileBase64: string | undefined;
         let mimeType: string | undefined;
+        let storagePath: string | undefined;
+        let prepared: File | undefined;
         if (file) {
-          fileBase64 = await fileToBase64(file);
-          mimeType = file.type;
+          // Shrink big phone photos; anything still too big for Vercel goes via Supabase Storage.
+          prepared = await shrinkImage(file);
+          mimeType = prepared.type || undefined;
+          if (prepared.size <= INLINE_LIMIT_BYTES) {
+            fileBase64 = await fileToBase64(prepared);
+          } else {
+            storagePath = `uploads/${crypto.randomUUID()}.${fileExtension(prepared)}`;
+            const up = await supabase.storage.from('receipts').upload(storagePath, prepared, {
+              contentType: prepared.type || undefined,
+            });
+            if (up.error) {
+              throw new Error(
+                `This file (${formatBytes(prepared.size)}) is too big to send directly, and uploading it to storage failed: ${up.error.message}. Has supabase/add-receipts.sql been run?`
+              );
+            }
+          }
         }
         const data = await callAi('/api/ai/parse-receipt', {
           fileBase64,
           mimeType,
+          storagePath,
           rawText: receiptText,
         });
         const foundSpools: any[] = Array.isArray(data.spools) ? data.spools : [];
@@ -402,7 +425,10 @@ export default function SpoolSplitApp() {
         if (typeof data.order_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(data.order_date)) {
           setReceiptDate(data.order_date);
         }
-        if (file) setReceiptFile(file);
+        if (prepared) {
+          setReceiptFile(prepared);
+          setReceiptStoragePath(storagePath || null);
+        }
         if (typeof data.vendor === 'string') setReceiptVendor(data.vendor);
         setReceiptTotal(Number(data.grand_total) > 0 ? Number(data.grand_total) : null);
         const expandedParts: StagedPart[] = [];
@@ -506,9 +532,14 @@ export default function SpoolSplitApp() {
         };
         // 2. The original file (optional: a failed upload doesn't lose the purchase)
         let uploadWarning: string | null = null;
-        if (receiptFile) {
-          const ext = (receiptFile.name.split('.').pop() || 'bin').toLowerCase().replace(/[^a-z0-9]/g, '');
-          const path = `${receipt.id}.${ext}`;
+        if (receiptFile && receiptStoragePath) {
+          // Already in storage (it was too big to send to the AI directly): just link it
+          await supabase
+            .from('receipts')
+            .update({ file_path: receiptStoragePath, file_type: receiptFile.type || null })
+            .eq('id', receipt.id);
+        } else if (receiptFile) {
+          const path = `${receipt.id}.${fileExtension(receiptFile)}`;
           const up = await supabase.storage.from('receipts').upload(path, receiptFile, {
             contentType: receiptFile.type || undefined,
             upsert: true,
@@ -541,6 +572,7 @@ export default function SpoolSplitApp() {
         setStagedParts([]);
         setReceiptText('');
         setReceiptFile(null);
+        setReceiptStoragePath(null);
         setReceiptVendor('');
         setReceiptTotal(null);
         if (uploadWarning) setErrorMsg(uploadWarning);
@@ -593,8 +625,14 @@ export default function SpoolSplitApp() {
         let fileBase64: string | undefined;
         let mimeType: string | undefined;
         if (file) {
-          fileBase64 = await fileToBase64(file);
-          mimeType = file.type;
+          const prepared = await shrinkImage(file);
+          if (prepared.size > INLINE_LIMIT_BYTES) {
+            throw new Error(
+              `That screenshot is ${formatBytes(prepared.size)}, too big to send (max about 3 MB). Try a smaller screenshot.`
+            );
+          }
+          fileBase64 = await fileToBase64(prepared);
+          mimeType = prepared.type;
         }
         const data = await callAi('/api/ai/parse-print', {
           fileBase64,
@@ -929,6 +967,8 @@ export default function SpoolSplitApp() {
             setReceiptVendor('');
             setReceiptTotal(null);
             setReceiptFile(null);
+            setReceiptStoragePath(null);
+        setReceiptStoragePath(null);
             setShowReceiptModal(true);
           }}
           className="flex items-center justify-center gap-2 bg-slate-800 hover:bg-slate-700 text-slate-100 font-semibold py-3.5 px-4 rounded-xl border border-slate-700 transition"

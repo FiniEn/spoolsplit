@@ -89,8 +89,21 @@ export async function POST(request: Request) {
     return NextResponse.json(data);
   } catch (err: any) {
     return NextResponse.json(
-      { error: err.message || 'Failed to parse print info' },
+      { error: readableError(err) || 'Failed to parse print info' },
       { status: 500 }
     );
   }
+}
+
+/** Gemini errors arrive as a JSON string; pull out the human-readable message. */
+function readableError(err: any): string {
+  const raw = String(err?.message || '');
+  try {
+    const parsed = JSON.parse(raw);
+    const msg = parsed?.error?.message || parsed?.message;
+    if (msg) return `Gemini: ${msg}`;
+  } catch {
+    // not JSON
+  }
+  return raw;
 }
