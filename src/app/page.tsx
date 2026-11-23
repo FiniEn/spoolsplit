@@ -961,7 +961,7 @@ export default function SpoolSplitApp() {
         </button>
         <button
           onClick={() => {
-            setStagedSpools([newStagedSpool({ color_name: 'Jade White', color_hex: '#ffffff' })]);
+            setStagedSpools([]);
             setStagedParts([]);
             setReceiptDate(todayIso());
             setReceiptVendor('');
