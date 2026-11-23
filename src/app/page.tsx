@@ -16,6 +16,7 @@ import {
   SplitMode,
   PART_CATEGORIES,
   PART_CATEGORY_LABELS,
+  TRACKED_PART_CATEGORIES,
 } from '@/lib/supabase';
 import { formatMinutes, printMinutesByUser } from '@/lib/split';
 import { computeWallet, manualShares, WalletEntry } from '@/lib/wallet';
@@ -57,8 +58,6 @@ type StagedPart = {
   split: SplitChoice;
   /** True while the split is the automatic default (follows category and who paid). */
   splitAuto: boolean;
-  /** Mark as installed on the purchase date when saving (starts its usage clock). */
-  installedNow: boolean;
 };
 
 /**
@@ -122,7 +121,7 @@ function SplitPicker({
         className={`bg-slate-900 border border-slate-800 rounded p-1.5 min-w-0 ${compact ? 'text-[11px]' : 'text-xs'}`}
         aria-label="How to split this item"
       >
-        <option value="default">By lifetime print time (default)</option>
+        <option value="default">By print time (default)</option>
         <option value="even">Split 50/50</option>
         {users.map((u) => (
           <option key={u.id} value={`personal:${u.id}`}>
@@ -185,7 +184,6 @@ const newStagedPart = (payerId: string, overrides: Partial<StagedPart> = {}): St
     price: '',
     split: defaultSplitFor(category, payerId),
     splitAuto: true,
-    installedNow: false,
     ...overrides,
   };
 };
@@ -249,6 +247,14 @@ export default function SpoolSplitApp() {
   const [receiptDraft, setReceiptDraft] = useState<ReceiptDraft | null>(null);
   /** Date chosen next to each part's Installed / Replaced button (defaults to today). */
   const [lifecycleDates, setLifecycleDates] = useState<Record<string, string>>({});
+  /** "+ Add part" form (parts without a receipt, e.g. the ones that came with the printer). */
+  const [newPart, setNewPart] = useState<{
+    name: string;
+    category: PartCategory;
+    price: string;
+    paidBy: string;
+    date: string;
+  } | null>(null);
   const [activeTab, setActiveTab] = useState<'prints' | 'spools' | 'settle'>('prints');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -282,6 +288,8 @@ export default function SpoolSplitApp() {
   const [usages, setUsages] = useState<UsageDraft[]>([]);
   /** Set while the print form edits an existing print instead of logging a new one. */
   const [editingPrintId, setEditingPrintId] = useState<string | null>(null);
+  /** Part picked per kind (nozzle, build plate, ...) for the print in the form; '' = none. */
+  const [printParts, setPrintParts] = useState<Partial<Record<PartCategory, string>>>({});
 
   // Settlement Form State
   const [settleFrom, setSettleFrom] = useState('');
@@ -315,7 +323,7 @@ export default function SpoolSplitApp() {
     }
     // Prints and their filament rows are loaded separately and joined here, so this works even if
     // the database has no foreign key between print_spool_usages.print_id and prints.id.
-    const [u, s, p, pu, st, pa, rc] = await Promise.all([
+    const [u, s, p, pu, st, pa, rc, pp] = await Promise.all([
       supabase.from('users').select('*').order('name'),
       supabase.from('spools').select('*').order('created_at', { ascending: false }),
       supabase.from('prints').select('*').order('created_at', { ascending: false }),
@@ -323,10 +331,16 @@ export default function SpoolSplitApp() {
       supabase.from('settlements').select('*').order('settled_at', { ascending: false }),
       supabase.from('parts').select('*').order('purchased_at', { ascending: false }),
       supabase.from('receipts').select('*').order('purchased_at', { ascending: false }),
+      supabase.from('print_part_usages').select('print_id, part_id'),
     ]);
     if (pa.error && /parts/.test(pa.error.message)) {
       throw new Error(
         `Could not load data: the "parts" table is missing. Run supabase/add-parts.sql once in the Supabase SQL Editor. (${pa.error.message})`
+      );
+    }
+    if (pp.error && /print_part_usages/.test(pp.error.message)) {
+      throw new Error(
+        `Could not load data: the "print_part_usages" table is missing. Run supabase/add-print-parts.sql once in the Supabase SQL Editor. (${pp.error.message})`
       );
     }
     if (rc.error && /receipts/.test(rc.error.message)) {
@@ -334,7 +348,7 @@ export default function SpoolSplitApp() {
         `Could not load data: the "receipts" table is missing. Run supabase/add-receipts.sql once in the Supabase SQL Editor. (${rc.error.message})`
       );
     }
-    const firstError = [u, s, p, pu, st, pa, rc].find((r) => r.error)?.error;
+    const firstError = [u, s, p, pu, st, pa, rc, pp].find((r) => r.error)?.error;
     if (firstError) throw new Error(`Could not load data: ${firstError.message}`);
 
     const userRows = (u.data || []) as User[];
@@ -349,6 +363,10 @@ export default function SpoolSplitApp() {
       }
     }
     setAllSpools((s.data || []) as Spool[]);
+    const partIdsByPrint = new Map<string, string[]>();
+    ((pp.data || []) as { print_id: string; part_id: string }[]).forEach((row) => {
+      partIdsByPrint.set(row.print_id, [...(partIdsByPrint.get(row.print_id) || []), row.part_id]);
+    });
     const usagesByPrint = new Map<string, PrintSpoolUsage[]>();
     ((pu.data || []) as PrintSpoolUsage[]).forEach((row) => {
       if (!row.print_id) return;
@@ -360,6 +378,7 @@ export default function SpoolSplitApp() {
       ((p.data || []) as PrintJob[]).map((pr) => ({
         ...pr,
         print_spool_usages: usagesByPrint.get(pr.id) || [],
+        part_ids: partIdsByPrint.get(pr.id) || [],
       }))
     );
     setSettlements((st.data || []) as Settlement[]);
@@ -545,7 +564,6 @@ export default function SpoolSplitApp() {
           paid_by_user_id: paidBy,
           purchased_at: receiptDate,
           ...splitToColumns(pt.split, paidBy, users),
-          ...(pt.installedNow && pt.split.mode === 'default' ? { installed_at: receiptDate } : {}),
         };
       });
       const itemsTotal =
@@ -603,15 +621,11 @@ export default function SpoolSplitApp() {
           const partRes = await supabase
             .from('parts')
             .insert(partRows.map((r) => ({ ...r, receipt_id: receipt.id })))
-            .select('id, name, category, installed_at');
+            .select('id');
           if (partRes.error) {
             // Keep the purchase all-or-nothing so a retry doesn't duplicate anything
             await undo(insertedSpoolIds);
             throw new Error(partRes.error.message);
-          }
-          // Parts installed right away may replace an installed part of the same kind
-          for (const row of (partRes.data || []) as Pick<Part, 'id' | 'name' | 'category' | 'installed_at'>[]) {
-            if (row.installed_at) await promptReplacements(row, row.installed_at);
           }
         }
         setStagedSpools([]);
@@ -780,59 +794,48 @@ export default function SpoolSplitApp() {
       else window.location.href = data.signedUrl;
     });
 
-  /** Other installed parts of the same kind that a newly installed part might replace. */
-  const replaceCandidates = (part: Pick<Part, 'id' | 'category'>, pool: Part[] = parts) =>
-    ['other', 'maintenance'].includes(part.category)
-      ? []
-      : pool.filter(
-          (x) =>
-            x.id !== part.id &&
-            x.category === part.category &&
-            (x.split_mode || 'default') === 'default' &&
-            x.installed_at &&
-            !x.retired_at
-        );
-
-  /** Asks, for each installed part of the same kind, whether the new one replaces it. */
-  const promptReplacements = async (part: Pick<Part, 'id' | 'category' | 'name'>, date: string, pool: Part[] = parts) => {
-    for (const old of replaceCandidates(part, pool)) {
-      const since = new Date(`${old.installed_at}T00:00:00`).toLocaleDateString();
-      if (!confirm(`Does "${part.name}" replace "${old.name}" (installed since ${since})?\n\nIt will be marked as replaced and its cost split by the print time while it was installed.`))
-        continue;
-      const retired = old.installed_at && old.installed_at > date ? old.installed_at : date;
-      check(await supabase.from('parts').update({ retired_at: retired }).eq('id', old.id));
-    }
-  };
-
-  const markInstalled = (part: Part) =>
+  const saveNewPart = () =>
     run(async () => {
-      const date = lifecycleDates[part.id] || todayIso();
-      check(await supabase.from('parts').update({ installed_at: date, retired_at: null }).eq('id', part.id));
-      await promptReplacements(part, date);
+      if (!newPart) return;
+      const price = Number(newPart.price);
+      if (!newPart.name.trim()) throw new Error('Give the part a name');
+      if (newPart.price === '' || !(price >= 0)) throw new Error('Enter a valid value ($0 is fine)');
+      if (!users.some((u) => u.id === newPart.paidBy)) throw new Error('Pick who paid');
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(newPart.date)) throw new Error('Pick the date');
+      const split = defaultSplitFor(newPart.category, newPart.paidBy);
+      check(
+        await supabase.from('parts').insert({
+          name: newPart.name.trim(),
+          category: newPart.category,
+          price: Number(price.toFixed(2)),
+          paid_by_user_id: newPart.paidBy,
+          purchased_at: newPart.date,
+          ...splitToColumns(split, newPart.paidBy, users),
+        })
+      );
+      setNewPart(null);
       await fetchAllData();
     });
 
   const markReplaced = (part: Part) =>
     run(async () => {
       const date = lifecycleDates[part.id] || todayIso();
-      if (part.installed_at && date < part.installed_at) {
-        throw new Error(`"${part.name}" was installed on ${part.installed_at}; the replacement date can't be earlier.`);
+      if (date < part.purchased_at.slice(0, 10)) {
+        throw new Error(`"${part.name}" was bought on ${part.purchased_at}; the replacement date can't be earlier.`);
       }
-      if (!confirm(`Mark "${part.name}" as replaced on ${new Date(`${date}T00:00:00`).toLocaleDateString()}? Its cost will be split by the print time while it was installed.`))
+      if (!confirm(`Mark "${part.name}" as replaced on ${new Date(`${date}T00:00:00`).toLocaleDateString()}? Its cost will be split by the print time it was used for, and it won't be offered for new prints.`))
         return;
       check(await supabase.from('parts').update({ retired_at: date }).eq('id', part.id));
       await fetchAllData();
     });
 
-  /** Undo: replaced -> installed again, or installed -> back to spare. */
-  const undoLifecycle = (part: Part) =>
+  const undoReplace = (part: Part) =>
     run(async () => {
-      const patch = part.retired_at ? { retired_at: null } : { installed_at: null };
-      check(await supabase.from('parts').update(patch).eq('id', part.id));
+      check(await supabase.from('parts').update({ retired_at: null }).eq('id', part.id));
       await fetchAllData();
     });
 
-  /** Status, estimate and Installed / Replaced controls for a default-split (pre-paid) part. */
+  /** Status, usage estimate and Replaced control for a default-split (pre-paid) part. */
   const renderLifecycle = (pt: Part) => {
     const info = wallet.partSplit.get(pt.id);
     if (!info || info.lifetime === 'manual' || users.length < 2) return null;
@@ -842,46 +845,50 @@ export default function SpoolSplitApp() {
     const totalMinutes = info.minutes ? (info.minutes[users[0].id] || 0) + (info.minutes[users[1].id] || 0) : 0;
     const split = users.map((u) => `${u.name} ${Math.round((info.shares[u.id] || 0) * 100)}%`).join(' / ');
     const fmt = (d?: string | null) => (d ? new Date(`${d.slice(0, 10)}T00:00:00`).toLocaleDateString() : '');
+    const prints = `${info.printCount || 0} print${info.printCount === 1 ? '' : 's'}`;
+    const tracked = TRACKED_PART_CATEGORIES.includes(pt.category);
     const chip =
       info.lifetime === 'spare'
-        ? { text: 'Spare', cls: 'bg-slate-800 text-slate-300' }
+        ? { text: 'Spare (in the box)', cls: 'bg-slate-800 text-slate-300' }
         : info.lifetime === 'pending'
-          ? { text: `Installed since ${fmt(pt.installed_at)}`, cls: 'bg-sky-500/15 text-sky-300' }
+          ? { text: `In use • ${prints}`, cls: 'bg-sky-500/15 text-sky-300' }
           : { text: `Replaced ${fmt(pt.retired_at)}`, cls: 'bg-emerald-500/15 text-emerald-300' };
     return (
       <div className="mt-1.5 space-y-1.5">
         <span className={`inline-block text-[11px] font-semibold px-2 py-0.5 rounded-full ${chip.cls}`}>{chip.text}</span>
         <p className="text-[11px] text-slate-400">
           {info.lifetime === 'spare' &&
-            `Pre-paid by ${userName(pt.paid_by_user_id)}. Nothing is owed until it's installed and later replaced.`}
+            (tracked
+              ? `Pre-paid by ${userName(pt.paid_by_user_id)}. Not used in a print yet — pick it under "Parts used" when you log a print.`
+              : `Pre-paid by ${userName(pt.paid_by_user_id)}. This kind of item isn't picked per print — set its split to 50/50, personal or custom %.`)}
           {info.lifetime === 'pending' &&
-            `So far ${formatMinutes(totalMinutes)} of printing: ${split} → ≈ ${money(owedAmount)} from ${owedBy.name}, charged when replaced.`}
+            `Used for ${formatMinutes(totalMinutes)} of printing: ${split} → ≈ ${money(owedAmount)} from ${owedBy.name}, charged when replaced.`}
           {info.lifetime === 'final' &&
             (totalMinutes > 0
-              ? `Lifetime ${formatMinutes(totalMinutes)} of printing: ${split} → ${money(owedAmount)} charged to ${owedBy.name}.`
-              : `No printing while installed: split 50/50 → ${money(owedAmount)} charged to ${owedBy.name}.`)}
+              ? `Used for ${formatMinutes(totalMinutes)} in ${prints}: ${split} → ${money(owedAmount)} charged to ${owedBy.name}.`
+              : `Not used in any print: split 50/50 → ${money(owedAmount)} charged to ${owedBy.name}.`)}
         </p>
         <div className="flex items-center gap-2 flex-wrap">
-          {info.lifetime !== 'final' && (
+          {info.lifetime === 'pending' && (
             <>
               <input
                 type="date"
                 value={date}
                 onChange={(e) => setLifecycleDates({ ...lifecycleDates, [pt.id]: e.target.value })}
                 className="bg-slate-950 border border-slate-800 rounded p-1 text-[11px]"
-                aria-label={info.lifetime === 'spare' ? 'Installed on' : 'Replaced on'}
+                aria-label="Replaced on"
               />
               <button
-                onClick={() => (info.lifetime === 'spare' ? markInstalled(pt) : markReplaced(pt))}
+                onClick={() => markReplaced(pt)}
                 className="text-[11px] font-semibold px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white"
               >
-                {info.lifetime === 'spare' ? 'Installed' : 'Replaced'}
+                Replaced
               </button>
             </>
           )}
-          {info.lifetime !== 'spare' && (
-            <button onClick={() => undoLifecycle(pt)} className="text-[11px] text-slate-400 hover:text-slate-200 underline">
-              {info.lifetime === 'final' ? 'Undo replace' : 'Back to spare'}
+          {info.lifetime === 'final' && (
+            <button onClick={() => undoReplace(pt)} className="text-[11px] text-slate-400 hover:text-slate-200 underline">
+              Undo replace
             </button>
           )}
         </div>
@@ -989,12 +996,38 @@ export default function SpoolSplitApp() {
     };
   })();
 
+  /** Parts of a kind that can be picked for a print (not replaced, or already used by the edited print). */
+  const partOptionsFor = (category: PartCategory) =>
+    parts.filter(
+      (pt) =>
+        pt.category === category &&
+        (pt.split_mode || 'default') === 'default' &&
+        (!pt.retired_at || printParts[category] === pt.id)
+    );
+
+  /** For each kind of part: the one used in the most recent print (if it isn't replaced). */
+  const lastUsedParts = (): Partial<Record<PartCategory, string>> => {
+    const picks: Partial<Record<PartCategory, string>> = {};
+    const newestFirst = [...prints].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+    for (const category of TRACKED_PART_CATEGORIES) {
+      const usable = new Set(
+        parts
+          .filter((pt) => pt.category === category && (pt.split_mode || 'default') === 'default' && !pt.retired_at)
+          .map((pt) => pt.id)
+      );
+      const last = newestFirst.find((pr) => (pr.part_ids || []).some((id) => usable.has(id)));
+      picks[category] = last ? (last.part_ids || []).find((id) => usable.has(id)) || '' : '';
+    }
+    return picks;
+  };
+
   const openNewPrint = () => {
     if (editingPrintId) {
       resetPrintForm();
       setEditingPrintId(null);
     }
     if (usages.length === 0 && spools[0]) setUsages([{ spool_id: spools[0].id, grams_used: 25 }]);
+    setPrintParts(lastUsedParts());
     setShowPrintModal(true);
   };
 
@@ -1010,6 +1043,12 @@ export default function SpoolSplitApp() {
     setPrintNoteOrUrl(print.source_url || '');
     setPrintSource(print.source_type || 'manual');
     setUsages((print.print_spool_usages || []).map((u) => ({ spool_id: u.spool_id, grams_used: Number(u.grams_used) })));
+    const picks: Partial<Record<PartCategory, string>> = {};
+    for (const id of print.part_ids || []) {
+      const pt = parts.find((x) => x.id === id);
+      if (pt) picks[pt.category] = pt.id;
+    }
+    setPrintParts(picks);
     setShowPrintModal(true);
   };
 
@@ -1030,6 +1069,7 @@ export default function SpoolSplitApp() {
     setPrintHint(null);
     setIsSharedPrint(false);
     setUsages([]);
+    setPrintParts({});
   };
 
   const savePrintJob = () =>
@@ -1058,6 +1098,7 @@ export default function SpoolSplitApp() {
         };
       });
 
+      const selectedPartIds = Object.values(printParts).filter((id): id is string => Boolean(id));
       setSaving(true);
       try {
         if (editingPrintId) {
@@ -1092,6 +1133,15 @@ export default function SpoolSplitApp() {
             if (old.length) await supabase.from('print_spool_usages').insert(old);
             throw new Error(ins.error.message);
           }
+          // Replace which parts the print used
+          check(await supabase.from('print_part_usages').delete().eq('print_id', editingPrintId));
+          if (selectedPartIds.length) {
+            check(
+              await supabase
+                .from('print_part_usages')
+                .insert(selectedPartIds.map((part_id) => ({ print_id: editingPrintId, part_id })))
+            );
+          }
           resetPrintForm();
           setEditingPrintId(null);
           setShowPrintModal(false);
@@ -1123,6 +1173,15 @@ export default function SpoolSplitApp() {
           // Don't leave a print with no filament rows behind
           await supabase.from('prints').delete().eq('id', newPrint.id);
           throw new Error(usageRes.error.message);
+        }
+        if (selectedPartIds.length) {
+          const linkRes = await supabase
+            .from('print_part_usages')
+            .insert(selectedPartIds.map((part_id) => ({ print_id: newPrint.id, part_id })));
+          if (linkRes.error) {
+            await supabase.from('prints').delete().eq('id', newPrint.id);
+            throw new Error(linkRes.error.message);
+          }
         }
 
         resetPrintForm();
@@ -1717,14 +1776,94 @@ export default function SpoolSplitApp() {
               <h3 className="text-sm font-semibold">Parts & Upkeep</h3>
             </div>
             <p className="text-xs text-slate-400">
-              Printer parts (nozzles, tubes, plates…) are pre-paid by whoever buys them. Tap Installed when one goes
-              in and Replaced when it comes out: its price is then split by each person's print time in between.
-              Other items are personal for the buyer by default. Any item can be changed to 50/50, personal or a
-              custom %. All-time print time:{' '}
+              Printer parts (nozzles, build plates, hotends, PTFE tubes, AMS parts) are pre-paid by whoever buys
+              them. Pick the ones a print used under &quot;Parts used&quot; when you log it. When a part is replaced, its
+              price is split by the print time of those prints. Other items are personal for the buyer by default.
+              Any item can be changed to 50/50, personal or a custom %. All-time print time:{' '}
               {users
                 .map((u) => `${u.name} ${formatMinutes(printTimeTotals[u.id] || 0)}`)
                 .join(' • ')}
             </p>
+            {!newPart ? (
+              <button
+                onClick={() =>
+                  setNewPart({ name: '', category: 'nozzle', price: '', paidBy: activeUserId, date: todayIso() })
+                }
+                className="text-xs text-emerald-400 font-medium"
+              >
+                + Add part (e.g. the nozzle or plate that came with the printer)
+              </button>
+            ) : (
+              <div className="bg-slate-900 border border-slate-800 rounded-xl p-3 space-y-2 text-xs">
+                <p className="font-semibold text-slate-200">Add a part without a receipt</p>
+                <input
+                  value={newPart.name}
+                  onChange={(e) => setNewPart({ ...newPart, name: e.target.value })}
+                  placeholder="e.g. Stock 0.4mm nozzle, Textured PEI plate"
+                  aria-label="Part name"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-sm"
+                />
+                <div className="grid grid-cols-2 gap-2">
+                  <select
+                    value={newPart.category}
+                    onChange={(e) => setNewPart({ ...newPart, category: e.target.value as PartCategory })}
+                    aria-label="Part category"
+                    className="bg-slate-950 border border-slate-800 rounded-lg p-2"
+                  >
+                    {PART_CATEGORIES.map((c) => (
+                      <option key={c} value={c}>
+                        {PART_CATEGORY_LABELS[c]}
+                      </option>
+                    ))}
+                  </select>
+                  <input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    value={newPart.price}
+                    onChange={(e) => setNewPart({ ...newPart, price: e.target.value })}
+                    placeholder="Value ($)"
+                    aria-label="Part value"
+                    className="bg-slate-950 border border-slate-800 rounded-lg p-2"
+                  />
+                  <select
+                    value={newPart.paidBy}
+                    onChange={(e) => setNewPart({ ...newPart, paidBy: e.target.value })}
+                    aria-label="Paid by"
+                    className="bg-slate-950 border border-slate-800 rounded-lg p-2"
+                  >
+                    {users.map((u) => (
+                      <option key={u.id} value={u.id}>
+                        Paid by {u.name}
+                      </option>
+                    ))}
+                  </select>
+                  <input
+                    type="date"
+                    value={newPart.date}
+                    onChange={(e) => setNewPart({ ...newPart, date: e.target.value })}
+                    aria-label="Bought on"
+                    className="bg-slate-950 border border-slate-800 rounded-lg p-2"
+                  />
+                </div>
+                <p className="text-[11px] text-slate-500">
+                  For a part that came with the printer, use its replacement price, who paid for the printer, and the
+                  date you got it.
+                </p>
+                <div className="grid grid-cols-2 gap-2">
+                  <button onClick={() => setNewPart(null)} className="bg-slate-800 hover:bg-slate-700 rounded-lg py-2 font-semibold">
+                    Cancel
+                  </button>
+                  <button
+                    onClick={saveNewPart}
+                    disabled={saving}
+                    className="bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-white rounded-lg py-2 font-semibold"
+                  >
+                    Add part
+                  </button>
+                </div>
+              </div>
+            )}
             {parts.length === 0 ? (
               <div className="text-center py-6 bg-slate-900/40 rounded-xl border border-slate-800/80 p-4">
                 <p className="text-xs text-slate-400">
@@ -1951,17 +2090,18 @@ export default function SpoolSplitApp() {
                     {userName(pp.part.paid_by_user_id)}&apos;s {pp.part.name}{' '}
                     <span className="text-slate-500">
                       {pp.status === 'spare'
-                        ? '— spare, not installed'
-                        : `— installed since ${new Date(`${pp.sinceDate}T00:00:00`).toLocaleDateString()}, ${userName(
-                            pp.owedBy
-                          )}'s share so far ≈ ${money(pp.estimatedOwed)}`}
+                        ? '— spare, not used in a print yet'
+                        : `— used in ${pp.printCount} print${pp.printCount === 1 ? '' : 's'} since ${new Date(
+                            `${pp.sinceDate}T00:00:00`
+                          ).toLocaleDateString()}, ${userName(pp.owedBy)}'s share so far ≈ ${money(pp.estimatedOwed)}`}
                     </span>
                   </span>
                   <span className="font-semibold shrink-0">{money(Number(pp.part.price))}</span>
                 </div>
               ))}
               <p className="text-[11px] text-slate-500">
-                Mark parts Installed / Replaced under Purchases. Not included in the settle-up amount yet.
+                Pick parts per print in Log Print Job; mark them Replaced under Purchases. Not included in the settle-up
+                amount yet.
               </p>
             </div>
           )}
@@ -2262,16 +2402,6 @@ export default function SpoolSplitApp() {
                     users={users}
                     onChange={(split) => updateStagedPart(idx, { split, splitAuto: false })}
                   />
-                  {pt.split.mode === 'default' && (
-                    <label className="flex items-center gap-1.5 text-[11px] text-slate-400">
-                      <input
-                        type="checkbox"
-                        checked={pt.installedNow}
-                        onChange={(e) => updateStagedPart(idx, { installedNow: e.target.checked })}
-                      />
-                      Installed now (starts its usage clock on the purchase date; leave off for spares)
-                    </label>
-                  )}
                   </div>
                 ))}
               </div>
@@ -2408,6 +2538,44 @@ export default function SpoolSplitApp() {
               <option value="shared">Shared Printer Upgrade (Split 50/50)</option>
             </select>
 
+            {/* Which parts this print used: their cost is split by the print time they're used for */}
+            {(() => {
+              const kinds = TRACKED_PART_CATEGORIES.filter((c) => partOptionsFor(c).length > 0);
+              return (
+                <div className="space-y-2">
+                  <label className="text-xs text-slate-400">Parts used (their cost is split by print time)</label>
+                  {kinds.length === 0 && (
+                    <p className="text-[11px] text-slate-500">
+                      No printer parts yet. Add your nozzle, build plate, etc. under Purchases → + Add part to track
+                      their wear.
+                    </p>
+                  )}
+                  {kinds.map((category) => (
+                    <div key={category} className="flex items-center gap-2">
+                      <span className="w-24 shrink-0 text-xs text-slate-400">{PART_CATEGORY_LABELS[category]}</span>
+                      <select
+                        value={printParts[category] || ''}
+                        onChange={(e) => setPrintParts({ ...printParts, [category]: e.target.value })}
+                        aria-label={`${PART_CATEGORY_LABELS[category]} used`}
+                        className="flex-1 min-w-0 bg-slate-950 border border-slate-800 rounded-lg p-2 text-xs"
+                      >
+                        <option value="">— none / not tracked —</option>
+                        {partOptionsFor(category).map((pt) => {
+                          const info = wallet.partSplit.get(pt.id);
+                          return (
+                            <option key={pt.id} value={pt.id}>
+                              {pt.name} — {userName(pt.paid_by_user_id)}&apos;s
+                              {pt.retired_at ? ' (replaced)' : info?.lifetime === 'spare' ? ' (spare, unused)' : ''}
+                            </option>
+                          );
+                        })}
+                      </select>
+                    </div>
+                  ))}
+                </div>
+              );
+            })()}
+
             <div className="space-y-2">
               <label className="text-xs text-slate-400">Filament Used (Grams per Spool)</label>
               {spools.length === 0 && (
@@ -2480,7 +2648,13 @@ export default function SpoolSplitApp() {
                   {editingPrintId ? ' (replaces what the print counted before)' : ''}
                 </p>
                 <p className="text-[11px] text-slate-500">
-                  The print time also counts toward installed parts, which are charged when they're replaced.
+                  {Object.values(printParts).some(Boolean)
+                    ? `The print time also counts toward ${Object.values(printParts)
+                        .filter(Boolean)
+                        .map((id) => parts.find((x) => x.id === id)?.name)
+                        .filter(Boolean)
+                        .join(', ')} (charged when replaced).`
+                    : 'No parts selected: the print time is not counted toward any part.'}
                 </p>
               </div>
             )}

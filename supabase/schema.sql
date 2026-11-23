@@ -1,7 +1,8 @@
 -- SpoolSplit database schema.
 -- Run in the Supabase SQL editor on a fresh project. It matches the fields the app reads and writes
 -- (see src/lib/supabase.ts). Safe to run more than once. Afterwards also run add-receipts.sql
--- (receipts, per-item splits and the receipt file storage) and add-part-lifecycle.sql (installed / replaced dates). If you already have tables, compare before running.
+-- (receipts, per-item splits and the receipt file storage) add-part-lifecycle.sql (replaced dates)
+-- and add-print-parts.sql (which parts each print used). If you already have tables, compare before running.
 
 create extension if not exists "pgcrypto";
 

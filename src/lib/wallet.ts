@@ -53,8 +53,8 @@ export interface PartSplitInfo {
   shares: Record<string, number>;
   /**
    * manual  = split chosen by hand, charged at purchase
-   * spare   = default split, not installed yet (nothing owed)
-   * pending = installed, split so far (charged when replaced)
+   * spare   = default split, not used in any print yet (nothing owed)
+   * pending = used in prints, split so far (charged when replaced)
    * final   = replaced, lifetime split charged
    */
   lifetime: 'manual' | 'spare' | 'pending' | 'final';
@@ -62,6 +62,8 @@ export interface PartSplitInfo {
   manual?: boolean;
   /** Print minutes per user that decided the split (default-split parts). */
   minutes?: Record<string, number>;
+  /** Number of prints that used the part (default-split parts). */
+  printCount?: number;
 }
 
 /** A pre-paid part that isn't settled yet (spare or still installed). */
@@ -73,6 +75,7 @@ export interface PendingPart {
   /** What the non-buyer would owe if it were replaced today. */
   estimatedOwed: number;
   owedBy: string;
+  printCount: number;
 }
 
 export interface WalletResult {
@@ -161,12 +164,11 @@ export function computeWallet(input: {
   const pct = (shares: Record<string, number>) =>
     `${name(A)} ${Math.round(shares[A] * 100)}% / ${name(B)} ${Math.round(shares[B] * 100)}%`;
   const otherOf = (payer: string) => (payer === A ? B : payer === B ? A : '');
-  /** Print minutes and shares between install and replacement (or today). */
+  /** Print minutes and shares from the prints that used this part. */
   const lifetimeSplit = (part: Part) => {
-    const since = (part.installed_at || part.purchased_at).slice(0, 10);
-    const until = part.retired_at ? part.retired_at.slice(0, 10) : undefined;
-    const minutes = printMinutesByUser(prints, [A, B], since, until);
-    return { minutes, shares: sharesOf(minutes) };
+    const used = prints.filter((pr) => (pr.part_ids || []).includes(part.id));
+    const minutes = printMinutesByUser(used, [A, B]);
+    return { minutes, shares: sharesOf(minutes), printCount: used.length };
   };
 
   for (const ev of events) {
@@ -210,7 +212,7 @@ export function computeWallet(input: {
         if (other) summary[other].partsShareOwed += Number(part.price || 0) * manual.shares[other];
       } else {
         // Default: the buyer pre-pays; the split is charged when the part is replaced.
-        entry.detail = `${money(Number(part.price))} • pre-paid by ${name(part.paid_by_user_id)}, split by print time when replaced`;
+        entry.detail = `${money(Number(part.price))} • pre-paid by ${name(part.paid_by_user_id)}, split by the print time it's used for, when replaced`;
       }
       current.push(entry);
     } else if (ev.kind === 'retire') {
@@ -220,14 +222,14 @@ export function computeWallet(input: {
       fixed += value;
       const other = otherOf(part.paid_by_user_id);
       if (other) summary[other].partsShareOwed += Number(part.price || 0) * shares[other];
-      partSplit.set(part.id, { shares, lifetime: 'final', minutes });
+      partSplit.set(part.id, { shares, lifetime: 'final', minutes, printCount: prints.filter((pr) => (pr.part_ids || []).includes(part.id)).length });
       const total = minutes[A] + minutes[B];
       current.push({
         key: `retire-${part.id}`,
         when: ev.ts,
         kind: 'part',
         title: `${part.name} replaced`,
-        detail: `${money(Number(part.price))} • ${total > 0 ? `lifetime ${formatMinutes(total)} of printing: ${pct(shares)}` : 'no printing while installed: split 50/50'}`,
+        detail: `${money(Number(part.price))} • ${total > 0 ? `used for ${formatMinutes(total)} of printing: ${pct(shares)}` : 'not used in any print: split 50/50'}`,
         delta: value,
         runningBalance: 0,
         amount: Number(part.price || 0),
@@ -311,17 +313,22 @@ export function computeWallet(input: {
   for (const part of parts) {
     if (manualShares(part, A, B) || part.retired_at) continue;
     const owedBy = otherOf(part.paid_by_user_id);
-    if (!part.installed_at) {
-      partSplit.set(part.id, { shares: { [A]: 0, [B]: 0 }, lifetime: 'spare' });
-      pendingParts.push({ part, status: 'spare', sinceDate: null, shares: { [A]: 0, [B]: 0 }, estimatedOwed: 0, owedBy });
+    const { minutes, shares, printCount } = lifetimeSplit(part);
+    if (printCount === 0) {
+      partSplit.set(part.id, { shares: { [A]: 0, [B]: 0 }, lifetime: 'spare', printCount: 0 });
+      pendingParts.push({ part, status: 'spare', sinceDate: null, shares: { [A]: 0, [B]: 0 }, estimatedOwed: 0, owedBy, printCount: 0 });
       continue;
     }
-    const { minutes, shares } = lifetimeSplit(part);
-    partSplit.set(part.id, { shares, lifetime: 'pending', minutes });
+    const firstUse = prints
+      .filter((pr) => (pr.part_ids || []).includes(part.id))
+      .map((pr) => pr.created_at.slice(0, 10))
+      .sort()[0];
+    partSplit.set(part.id, { shares, lifetime: 'pending', minutes, printCount });
     pendingParts.push({
       part,
       status: 'installed',
-      sinceDate: part.installed_at.slice(0, 10),
+      printCount,
+      sinceDate: firstUse,
       shares,
       estimatedOwed: owedBy ? Number(part.price || 0) * shares[owedBy] : 0,
       owedBy,

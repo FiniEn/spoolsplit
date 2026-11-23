@@ -61,6 +61,8 @@ export interface PrintJob {
   total_cost: number;
   created_at: string;
   print_spool_usages?: PrintSpoolUsage[];
+  /** Parts (nozzle, plate, ...) this print used; joined client-side from print_part_usages. */
+  part_ids?: string[];
 }
 
 export interface Settlement {
@@ -83,6 +85,9 @@ export const PART_CATEGORIES = [
   'other',
 ] as const;
 export type PartCategory = (typeof PART_CATEGORIES)[number];
+
+/** Kinds of parts picked per print (their cost is split by the print time they were used for). */
+export const TRACKED_PART_CATEGORIES: PartCategory[] = ['nozzle', 'build_plate', 'hotend', 'ptfe_tube', 'ams_part'];
 
 export const PART_CATEGORY_LABELS: Record<PartCategory, string> = {
   nozzle: 'Nozzle',
@@ -109,9 +114,10 @@ export interface Part {
   personal_user_id?: string | null;
   /** For 'custom': the share (0..1) the buyer covers; the other person owes the rest. */
   payer_share?: number | null;
-  /** Default-split parts: the buyer pre-pays; print time between these dates decides the split. */
-  installed_at?: string | null; // YYYY-MM-DD; null = spare, not installed yet
-  retired_at?: string | null; // YYYY-MM-DD; set when replaced -> the split is charged
+  /** Legacy install date (usage now comes from the prints that used the part). */
+  installed_at?: string | null;
+  /** YYYY-MM-DD; set when replaced -> the split (by print time of prints that used it) is charged. */
+  retired_at?: string | null;
 
   created_at: string;
 }
