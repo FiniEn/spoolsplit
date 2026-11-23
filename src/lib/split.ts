@@ -4,18 +4,21 @@ import type { PrintJob } from './supabase';
 const day = (ts: string) => ts.slice(0, 10);
 
 /**
- * Print minutes per user for prints created on or after `sinceDate` (YYYY-MM-DD; omit for all time).
+ * Print minutes per user for prints created between `sinceDate` and `untilDate` (YYYY-MM-DD,
+ * both inclusive; omit either for an open end).
  * Shared prints count half for each of the two users.
  */
 export function printMinutesByUser(
   prints: PrintJob[],
   userIds: [string, string],
-  sinceDate?: string
+  sinceDate?: string,
+  untilDate?: string
 ): Record<string, number> {
   const [a, b] = userIds;
   const minutes: Record<string, number> = { [a]: 0, [b]: 0 };
   for (const p of prints) {
     if (sinceDate && day(p.created_at) < sinceDate) continue;
+    if (untilDate && day(p.created_at) > untilDate) continue;
     const m = Math.max(0, Number(p.duration_minutes || 0));
     if (!m) continue;
     if (p.is_shared_print) {

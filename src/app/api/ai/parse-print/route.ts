@@ -1,5 +1,9 @@
 import { NextResponse } from 'next/server';
-import { GoogleGenAI, Type } from '@google/genai';
+import { Type } from '@google/genai';
+import { generateJsonWithFallback, readableGeminiError } from '@/lib/gemini';
+
+// Retries and model fallbacks can take a while; allow up to a minute on Vercel.
+export const maxDuration = 60;
 
 export async function POST(request: Request) {
   try {
@@ -14,7 +18,6 @@ export async function POST(request: Request) {
     if (fileBase64 && fileBase64.length > 14_000_000) {
       return NextResponse.json({ error: 'File is too large (max ~10 MB)' }, { status: 413 });
     }
-    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
     const spoolContext = JSON.stringify(
       (activeSpools || []).map((s: any) => ({
@@ -56,12 +59,9 @@ export async function POST(request: Request) {
       parts.push({ text: `Model/Page Info:\n${rawText}` });
     }
 
-    const response = await ai.models.generateContent({
-      model: process.env.GEMINI_MODEL || 'gemini-3.8-flash',
-      contents: [{ role: 'user', parts }],
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
+    const { data } = await generateJsonWithFallback({
+      parts,
+      responseSchema: {
           type: Type.OBJECT,
           properties: {
             title: { type: Type.STRING },
@@ -81,15 +81,12 @@ export async function POST(request: Request) {
             },
           },
           required: ['title', 'duration_minutes', 'filament_usages'],
-        },
       },
     });
-
-    const data = JSON.parse(response.text || '{}');
     return NextResponse.json(data);
   } catch (err: any) {
     return NextResponse.json(
-      { error: err.message || 'Failed to parse print info' },
+      { error: readableGeminiError(err) || 'Failed to parse print info' },
       { status: 500 }
     );
   }

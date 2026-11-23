@@ -19,6 +19,7 @@ import {
 } from '@/lib/supabase';
 import { formatMinutes, printMinutesByUser } from '@/lib/split';
 import { computeWallet, manualShares, WalletEntry } from '@/lib/wallet';
+import { INLINE_LIMIT_BYTES, fileExtension, formatBytes, shrinkImage } from '@/lib/upload';
 import {
   Disc,
   Printer,
@@ -37,6 +38,7 @@ import {
   ExternalLink,
   FileText,
   Lock,
+  Pencil,
 } from 'lucide-react';
 
 type StagedSpool = {
@@ -53,6 +55,10 @@ type StagedPart = {
   category: PartCategory;
   price: number | string;
   split: SplitChoice;
+  /** True while the split is the automatic default (follows category and who paid). */
+  splitAuto: boolean;
+  /** Mark as installed on the purchase date when saving (starts its usage clock). */
+  installedNow: boolean;
 };
 
 /**
@@ -116,7 +122,7 @@ function SplitPicker({
         className={`bg-slate-900 border border-slate-800 rounded p-1.5 min-w-0 ${compact ? 'text-[11px]' : 'text-xs'}`}
         aria-label="How to split this item"
       >
-        <option value="default">By print time (default)</option>
+        <option value="default">By lifetime print time (default)</option>
         <option value="even">Split 50/50</option>
         {users.map((u) => (
           <option key={u.id} value={`personal:${u.id}`}>
@@ -148,13 +154,41 @@ function SplitPicker({
 
 type UsageDraft = { spool_id: string; grams_used: number };
 
-const newStagedPart = (overrides: Partial<StagedPart> = {}): StagedPart => ({
-  name: '',
-  category: 'nozzle',
-  price: '',
-  split: DEFAULT_SPLIT,
-  ...overrides,
-});
+/** Editable copy of a saved receipt and its items (string fields = form inputs). */
+type ReceiptDraft = {
+  id: string;
+  vendor: string;
+  purchased_at: string;
+  paid_by_user_id: string;
+  total: string;
+  spools: {
+    id: string;
+    brand: string;
+    material: string;
+    color_name: string;
+    color_hex: string;
+    initial_weight_g: string;
+    purchase_price: string;
+  }[];
+  parts: { id: string; name: string; category: PartCategory; price: string }[];
+};
+
+/** Printer parts are pre-paid and split by lifetime print time; "Other item" is personal for the buyer. */
+const defaultSplitFor = (category: PartCategory, payerId: string): SplitChoice =>
+  category === 'other' ? { mode: 'personal', personalUserId: payerId || null, firstUserPct: 50 } : DEFAULT_SPLIT;
+
+const newStagedPart = (payerId: string, overrides: Partial<StagedPart> = {}): StagedPart => {
+  const category = overrides.category || 'nozzle';
+  return {
+    name: '',
+    category,
+    price: '',
+    split: defaultSplitFor(category, payerId),
+    splitAuto: true,
+    installedNow: false,
+    ...overrides,
+  };
+};
 
 /** Today's date as YYYY-MM-DD in the viewer's time zone. */
 const todayIso = () => {
@@ -194,6 +228,9 @@ async function callAi(path: string, body: unknown) {
     // fall through to the status check below
   }
   if (!res.ok || data?.error) {
+    if (res.status === 413 && !data?.error) {
+      throw new Error('That file is too large to send. Try a smaller photo or screenshot.');
+    }
     throw new Error(data?.error || `AI request failed (${res.status})`);
   }
   return data;
@@ -209,6 +246,9 @@ export default function SpoolSplitApp() {
   const [parts, setParts] = useState<Part[]>([]);
   const [receipts, setReceipts] = useState<ReceiptRecord[]>([]);
   const [openReceiptId, setOpenReceiptId] = useState<string | null>(null);
+  const [receiptDraft, setReceiptDraft] = useState<ReceiptDraft | null>(null);
+  /** Date chosen next to each part's Installed / Replaced button (defaults to today). */
+  const [lifecycleDates, setLifecycleDates] = useState<Record<string, string>>({});
   const [activeTab, setActiveTab] = useState<'prints' | 'spools' | 'settle'>('prints');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -227,6 +267,8 @@ export default function SpoolSplitApp() {
   const [receiptVendor, setReceiptVendor] = useState('');
   const [receiptTotal, setReceiptTotal] = useState<number | null>(null);
   const [receiptFile, setReceiptFile] = useState<File | null>(null);
+  /** Set when a large receipt file was already put in storage for the AI to read. */
+  const [receiptStoragePath, setReceiptStoragePath] = useState<string | null>(null);
 
   // Print Logger State
   const [printTitle, setPrintTitle] = useState('');
@@ -385,13 +427,30 @@ export default function SpoolSplitApp() {
       try {
         let fileBase64: string | undefined;
         let mimeType: string | undefined;
+        let storagePath: string | undefined;
+        let prepared: File | undefined;
         if (file) {
-          fileBase64 = await fileToBase64(file);
-          mimeType = file.type;
+          // Shrink big phone photos; anything still too big for Vercel goes via Supabase Storage.
+          prepared = await shrinkImage(file);
+          mimeType = prepared.type || undefined;
+          if (prepared.size <= INLINE_LIMIT_BYTES) {
+            fileBase64 = await fileToBase64(prepared);
+          } else {
+            storagePath = `uploads/${crypto.randomUUID()}.${fileExtension(prepared)}`;
+            const up = await supabase.storage.from('receipts').upload(storagePath, prepared, {
+              contentType: prepared.type || undefined,
+            });
+            if (up.error) {
+              throw new Error(
+                `This file (${formatBytes(prepared.size)}) is too big to send directly, and uploading it to storage failed: ${up.error.message}. Has supabase/add-receipts.sql been run?`
+              );
+            }
+          }
         }
         const data = await callAi('/api/ai/parse-receipt', {
           fileBase64,
           mimeType,
+          storagePath,
           rawText: receiptText,
         });
         const foundSpools: any[] = Array.isArray(data.spools) ? data.spools : [];
@@ -402,7 +461,10 @@ export default function SpoolSplitApp() {
         if (typeof data.order_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(data.order_date)) {
           setReceiptDate(data.order_date);
         }
-        if (file) setReceiptFile(file);
+        if (prepared) {
+          setReceiptFile(prepared);
+          setReceiptStoragePath(storagePath || null);
+        }
         if (typeof data.vendor === 'string') setReceiptVendor(data.vendor);
         setReceiptTotal(Number(data.grand_total) > 0 ? Number(data.grand_total) : null);
         const expandedParts: StagedPart[] = [];
@@ -411,7 +473,7 @@ export default function SpoolSplitApp() {
           const category: PartCategory = PART_CATEGORIES.includes(pt.category) ? pt.category : 'other';
           for (let i = 0; i < qty; i++) {
             expandedParts.push(
-              newStagedPart({
+              newStagedPart(receiptPaidBy || activeUserId, {
                 name: pt.name || PART_CATEGORY_LABELS[category],
                 category,
                 price: Number(pt.unit_landed_cost || 0).toFixed(2),
@@ -481,6 +543,7 @@ export default function SpoolSplitApp() {
           paid_by_user_id: paidBy,
           purchased_at: receiptDate,
           ...splitToColumns(pt.split, paidBy, users),
+          ...(pt.installedNow && pt.split.mode === 'default' ? { installed_at: receiptDate } : {}),
         };
       });
       const itemsTotal =
@@ -506,9 +569,14 @@ export default function SpoolSplitApp() {
         };
         // 2. The original file (optional: a failed upload doesn't lose the purchase)
         let uploadWarning: string | null = null;
-        if (receiptFile) {
-          const ext = (receiptFile.name.split('.').pop() || 'bin').toLowerCase().replace(/[^a-z0-9]/g, '');
-          const path = `${receipt.id}.${ext}`;
+        if (receiptFile && receiptStoragePath) {
+          // Already in storage (it was too big to send to the AI directly): just link it
+          await supabase
+            .from('receipts')
+            .update({ file_path: receiptStoragePath, file_type: receiptFile.type || null })
+            .eq('id', receipt.id);
+        } else if (receiptFile) {
+          const path = `${receipt.id}.${fileExtension(receiptFile)}`;
           const up = await supabase.storage.from('receipts').upload(path, receiptFile, {
             contentType: receiptFile.type || undefined,
             upsert: true,
@@ -530,21 +598,159 @@ export default function SpoolSplitApp() {
           insertedSpoolIds = (res.data || []).map((r: { id: string }) => r.id);
         }
         if (partRows.length > 0) {
-          const partRes = await supabase.from('parts').insert(partRows.map((r) => ({ ...r, receipt_id: receipt.id })));
+          const partRes = await supabase
+            .from('parts')
+            .insert(partRows.map((r) => ({ ...r, receipt_id: receipt.id })))
+            .select('id, name, category, installed_at');
           if (partRes.error) {
             // Keep the purchase all-or-nothing so a retry doesn't duplicate anything
             await undo(insertedSpoolIds);
             throw new Error(partRes.error.message);
+          }
+          // Parts installed right away may replace an installed part of the same kind
+          for (const row of (partRes.data || []) as Pick<Part, 'id' | 'name' | 'category' | 'installed_at'>[]) {
+            if (row.installed_at) await promptReplacements(row, row.installed_at);
           }
         }
         setStagedSpools([]);
         setStagedParts([]);
         setReceiptText('');
         setReceiptFile(null);
+        setReceiptStoragePath(null);
         setReceiptVendor('');
         setReceiptTotal(null);
         if (uploadWarning) setErrorMsg(uploadWarning);
         setShowReceiptModal(false);
+        await fetchAllData();
+      } finally {
+        setSaving(false);
+      }
+    });
+
+  const startEditReceipt = (rec: ReceiptRecord, recSpools: Spool[], recParts: Part[]) =>
+    setReceiptDraft({
+      id: rec.id,
+      vendor: rec.vendor || '',
+      purchased_at: rec.purchased_at.slice(0, 10),
+      paid_by_user_id: rec.paid_by_user_id,
+      total: Number(rec.total).toFixed(2),
+      spools: recSpools.map((sp) => ({
+        id: sp.id,
+        brand: sp.brand,
+        material: sp.material,
+        color_name: sp.color_name,
+        color_hex: sp.color_hex,
+        initial_weight_g: String(Number(sp.initial_weight_g)),
+        purchase_price: Number(sp.purchase_price).toFixed(2),
+      })),
+      parts: recParts.map((pt) => ({ id: pt.id, name: pt.name, category: pt.category, price: Number(pt.price).toFixed(2) })),
+    });
+
+  /**
+   * Saves an edited receipt: the receipt, every item on it (who paid follows the receipt), and,
+   * when a spool's price or weight changed, the cost of prints already made from that spool.
+   */
+  const saveReceiptEdit = () =>
+    run(async () => {
+      const d = receiptDraft;
+      if (!d) return;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(d.purchased_at)) throw new Error('Pick the purchase date');
+      if (!users.some((u) => u.id === d.paid_by_user_id)) throw new Error('Pick who paid');
+      const total = Number(d.total);
+      if (d.total === '' || !(total >= 0)) throw new Error('Enter a valid total');
+      for (const sp of d.spools) {
+        if (!(Number(sp.initial_weight_g) > 0)) throw new Error(`Spool "${sp.color_name}" needs a weight above 0 g`);
+        if (sp.purchase_price === '' || !(Number(sp.purchase_price) >= 0))
+          throw new Error(`Spool "${sp.color_name}" needs a valid price`);
+      }
+      for (const pt of d.parts) {
+        if (!pt.name.trim()) throw new Error('Every part needs a name');
+        if (pt.price === '' || !(Number(pt.price) >= 0)) throw new Error(`Part "${pt.name}" needs a valid price`);
+      }
+      setSaving(true);
+      try {
+        check(
+          await supabase
+            .from('receipts')
+            .update({
+              vendor: d.vendor.trim(),
+              purchased_at: d.purchased_at,
+              paid_by_user_id: d.paid_by_user_id,
+              total: Number(total.toFixed(2)),
+            })
+            .eq('id', d.id)
+        );
+
+        // New cost per print-usage row for every spool whose price per gram changed
+        const newCostByUsage = new Map<string, number>();
+        for (const sp of d.spools) {
+          const before = allSpools.find((x) => x.id === sp.id);
+          const weight = Number(sp.initial_weight_g);
+          const price = Number(Number(sp.purchase_price).toFixed(2));
+          check(
+            await supabase
+              .from('spools')
+              .update({
+                brand: sp.brand.trim(),
+                material: sp.material.trim(),
+                color_name: sp.color_name.trim(),
+                color_hex: sp.color_hex,
+                initial_weight_g: weight,
+                remaining_weight_g: weight,
+                purchase_price: price,
+                paid_by_user_id: d.paid_by_user_id,
+              })
+              .eq('id', sp.id)
+          );
+          if (before && (Number(before.purchase_price) !== price || Number(before.initial_weight_g) !== weight)) {
+            for (const pr of prints) {
+              for (const u of pr.print_spool_usages || []) {
+                if (u.spool_id === sp.id && u.id) {
+                  newCostByUsage.set(u.id, Number((Number(u.grams_used) * (price / weight)).toFixed(2)));
+                }
+              }
+            }
+          }
+        }
+        // Re-cost the prints that already used a changed spool
+        if (newCostByUsage.size > 0) {
+          for (const [usageId, cost] of newCostByUsage) {
+            check(await supabase.from('print_spool_usages').update({ calculated_cost: cost }).eq('id', usageId));
+          }
+          for (const pr of prints) {
+            const usages = pr.print_spool_usages || [];
+            if (!usages.some((u) => u.id && newCostByUsage.has(u.id))) continue;
+            const totalCost = usages.reduce(
+              (sum, u) => sum + (u.id && newCostByUsage.has(u.id) ? newCostByUsage.get(u.id)! : Number(u.calculated_cost || 0)),
+              0
+            );
+            check(await supabase.from('prints').update({ total_cost: Number(totalCost.toFixed(2)) }).eq('id', pr.id));
+          }
+        }
+
+        for (const pt of d.parts) {
+          const before = parts.find((x) => x.id === pt.id);
+          const payerChanged = before && before.paid_by_user_id !== d.paid_by_user_id;
+          // A custom % is stored as the buyer's share; keep the same person-to-person split if the buyer changes
+          const payerShare =
+            before?.split_mode === 'custom' && before.payer_share != null && payerChanged
+              ? Number((1 - Number(before.payer_share)).toFixed(4))
+              : before?.payer_share ?? null;
+          check(
+            await supabase
+              .from('parts')
+              .update({
+                name: pt.name.trim(),
+                category: pt.category,
+                price: Number(Number(pt.price).toFixed(2)),
+                paid_by_user_id: d.paid_by_user_id,
+                purchased_at: d.purchased_at,
+                ...(before?.split_mode === 'custom' ? { payer_share: payerShare } : {}),
+              })
+              .eq('id', pt.id)
+          );
+        }
+        setReceiptDraft(null);
         await fetchAllData();
       } finally {
         setSaving(false);
@@ -572,6 +778,115 @@ export default function SpoolSplitApp() {
       else window.location.href = data.signedUrl;
     });
 
+  /** Other installed parts of the same kind that a newly installed part might replace. */
+  const replaceCandidates = (part: Pick<Part, 'id' | 'category'>, pool: Part[] = parts) =>
+    ['other', 'maintenance'].includes(part.category)
+      ? []
+      : pool.filter(
+          (x) =>
+            x.id !== part.id &&
+            x.category === part.category &&
+            (x.split_mode || 'default') === 'default' &&
+            x.installed_at &&
+            !x.retired_at
+        );
+
+  /** Asks, for each installed part of the same kind, whether the new one replaces it. */
+  const promptReplacements = async (part: Pick<Part, 'id' | 'category' | 'name'>, date: string, pool: Part[] = parts) => {
+    for (const old of replaceCandidates(part, pool)) {
+      const since = new Date(`${old.installed_at}T00:00:00`).toLocaleDateString();
+      if (!confirm(`Does "${part.name}" replace "${old.name}" (installed since ${since})?\n\nIt will be marked as replaced and its cost split by the print time while it was installed.`))
+        continue;
+      const retired = old.installed_at && old.installed_at > date ? old.installed_at : date;
+      check(await supabase.from('parts').update({ retired_at: retired }).eq('id', old.id));
+    }
+  };
+
+  const markInstalled = (part: Part) =>
+    run(async () => {
+      const date = lifecycleDates[part.id] || todayIso();
+      check(await supabase.from('parts').update({ installed_at: date, retired_at: null }).eq('id', part.id));
+      await promptReplacements(part, date);
+      await fetchAllData();
+    });
+
+  const markReplaced = (part: Part) =>
+    run(async () => {
+      const date = lifecycleDates[part.id] || todayIso();
+      if (part.installed_at && date < part.installed_at) {
+        throw new Error(`"${part.name}" was installed on ${part.installed_at}; the replacement date can't be earlier.`);
+      }
+      if (!confirm(`Mark "${part.name}" as replaced on ${new Date(`${date}T00:00:00`).toLocaleDateString()}? Its cost will be split by the print time while it was installed.`))
+        return;
+      check(await supabase.from('parts').update({ retired_at: date }).eq('id', part.id));
+      await fetchAllData();
+    });
+
+  /** Undo: replaced -> installed again, or installed -> back to spare. */
+  const undoLifecycle = (part: Part) =>
+    run(async () => {
+      const patch = part.retired_at ? { retired_at: null } : { installed_at: null };
+      check(await supabase.from('parts').update(patch).eq('id', part.id));
+      await fetchAllData();
+    });
+
+  /** Status, estimate and Installed / Replaced controls for a default-split (pre-paid) part. */
+  const renderLifecycle = (pt: Part) => {
+    const info = wallet.partSplit.get(pt.id);
+    if (!info || info.lifetime === 'manual' || users.length < 2) return null;
+    const date = lifecycleDates[pt.id] || todayIso();
+    const owedBy = pt.paid_by_user_id === users[0].id ? users[1] : users[0];
+    const owedAmount = Number(pt.price || 0) * (info.shares[owedBy.id] || 0);
+    const totalMinutes = info.minutes ? (info.minutes[users[0].id] || 0) + (info.minutes[users[1].id] || 0) : 0;
+    const split = users.map((u) => `${u.name} ${Math.round((info.shares[u.id] || 0) * 100)}%`).join(' / ');
+    const fmt = (d?: string | null) => (d ? new Date(`${d.slice(0, 10)}T00:00:00`).toLocaleDateString() : '');
+    const chip =
+      info.lifetime === 'spare'
+        ? { text: 'Spare', cls: 'bg-slate-800 text-slate-300' }
+        : info.lifetime === 'pending'
+          ? { text: `Installed since ${fmt(pt.installed_at)}`, cls: 'bg-sky-500/15 text-sky-300' }
+          : { text: `Replaced ${fmt(pt.retired_at)}`, cls: 'bg-emerald-500/15 text-emerald-300' };
+    return (
+      <div className="mt-1.5 space-y-1.5">
+        <span className={`inline-block text-[11px] font-semibold px-2 py-0.5 rounded-full ${chip.cls}`}>{chip.text}</span>
+        <p className="text-[11px] text-slate-400">
+          {info.lifetime === 'spare' &&
+            `Pre-paid by ${userName(pt.paid_by_user_id)}. Nothing is owed until it's installed and later replaced.`}
+          {info.lifetime === 'pending' &&
+            `So far ${formatMinutes(totalMinutes)} of printing: ${split} → ≈ ${money(owedAmount)} from ${owedBy.name}, charged when replaced.`}
+          {info.lifetime === 'final' &&
+            (totalMinutes > 0
+              ? `Lifetime ${formatMinutes(totalMinutes)} of printing: ${split} → ${money(owedAmount)} charged to ${owedBy.name}.`
+              : `No printing while installed: split 50/50 → ${money(owedAmount)} charged to ${owedBy.name}.`)}
+        </p>
+        <div className="flex items-center gap-2 flex-wrap">
+          {info.lifetime !== 'final' && (
+            <>
+              <input
+                type="date"
+                value={date}
+                onChange={(e) => setLifecycleDates({ ...lifecycleDates, [pt.id]: e.target.value })}
+                className="bg-slate-950 border border-slate-800 rounded p-1 text-[11px]"
+                aria-label={info.lifetime === 'spare' ? 'Installed on' : 'Replaced on'}
+              />
+              <button
+                onClick={() => (info.lifetime === 'spare' ? markInstalled(pt) : markReplaced(pt))}
+                className="text-[11px] font-semibold px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white"
+              >
+                {info.lifetime === 'spare' ? 'Installed' : 'Replaced'}
+              </button>
+            </>
+          )}
+          {info.lifetime !== 'spare' && (
+            <button onClick={() => undoLifecycle(pt)} className="text-[11px] text-slate-400 hover:text-slate-200 underline">
+              {info.lifetime === 'final' ? 'Undo replace' : 'Back to spare'}
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  };
+
   const deletePart = (part: Part) =>
     run(async () => {
       if (!confirm(`Delete "${part.name}" (${money(Number(part.price))})? Its cost will be removed from the balance.`))
@@ -593,8 +908,14 @@ export default function SpoolSplitApp() {
         let fileBase64: string | undefined;
         let mimeType: string | undefined;
         if (file) {
-          fileBase64 = await fileToBase64(file);
-          mimeType = file.type;
+          const prepared = await shrinkImage(file);
+          if (prepared.size > INLINE_LIMIT_BYTES) {
+            throw new Error(
+              `That screenshot is ${formatBytes(prepared.size)}, too big to send (max about 3 MB). Try a smaller screenshot.`
+            );
+          }
+          fileBase64 = await fileToBase64(prepared);
+          mimeType = prepared.type;
         }
         const data = await callAi('/api/ai/parse-print', {
           fileBase64,
@@ -923,12 +1244,14 @@ export default function SpoolSplitApp() {
         </button>
         <button
           onClick={() => {
-            setStagedSpools([newStagedSpool({ color_name: 'Jade White', color_hex: '#ffffff' })]);
+            setStagedSpools([]);
             setStagedParts([]);
             setReceiptDate(todayIso());
             setReceiptVendor('');
             setReceiptTotal(null);
             setReceiptFile(null);
+            setReceiptStoragePath(null);
+        setReceiptStoragePath(null);
             setShowReceiptModal(true);
           }}
           className="flex items-center justify-center gap-2 bg-slate-800 hover:bg-slate-700 text-slate-100 font-semibold py-3.5 px-4 rounded-xl border border-slate-700 transition"
@@ -1042,7 +1365,133 @@ export default function SpoolSplitApp() {
                       <ChevronDown className={`w-4 h-4 text-slate-400 transition ${isOpen ? 'rotate-180' : ''}`} />
                     </div>
                   </button>
-                  {isOpen && (
+                  {isOpen && receiptDraft?.id === rec.id && (
+                    <div className="border-t border-slate-800 p-3 space-y-3 text-xs">
+                      <div className="grid grid-cols-2 gap-2">
+                        <label className="space-y-1">
+                          <span className="text-slate-400">Who paid</span>
+                          <select
+                            value={receiptDraft.paid_by_user_id}
+                            onChange={(e) => setReceiptDraft({ ...receiptDraft, paid_by_user_id: e.target.value })}
+                            className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-sm"
+                          >
+                            {users.map((u) => (
+                              <option key={u.id} value={u.id}>
+                                {u.name}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="space-y-1">
+                          <span className="text-slate-400">Purchase date</span>
+                          <input
+                            type="date"
+                            value={receiptDraft.purchased_at}
+                            onChange={(e) => setReceiptDraft({ ...receiptDraft, purchased_at: e.target.value })}
+                            className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-sm"
+                          />
+                        </label>
+                        <label className="space-y-1">
+                          <span className="text-slate-400">Store</span>
+                          <input
+                            value={receiptDraft.vendor}
+                            onChange={(e) => setReceiptDraft({ ...receiptDraft, vendor: e.target.value })}
+                            className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-sm"
+                          />
+                        </label>
+                        <label className="space-y-1">
+                          <span className="text-slate-400">Receipt total ($)</span>
+                          <input
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            value={receiptDraft.total}
+                            onChange={(e) => setReceiptDraft({ ...receiptDraft, total: e.target.value })}
+                            className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-sm"
+                          />
+                        </label>
+                      </div>
+
+                      {receiptDraft.spools.length > 0 && (
+                        <p className="text-slate-300 font-semibold">Spools (material, color, grams, $)</p>
+                      )}
+                      {receiptDraft.spools.map((sp, idx) => {
+                        const setSp = (patch: Partial<ReceiptDraft['spools'][number]>) =>
+                          setReceiptDraft({
+                            ...receiptDraft,
+                            spools: receiptDraft.spools.map((x, i) => (i === idx ? { ...x, ...patch } : x)),
+                          });
+                        return (
+                          <div
+                            key={sp.id}
+                            className="grid grid-cols-[auto_1fr_1fr_1fr_1fr] items-center gap-1.5 bg-slate-950 p-2 rounded-lg border border-slate-800"
+                          >
+                            <input
+                              type="color"
+                              value={/^#[0-9a-fA-F]{6}$/.test(sp.color_hex) ? sp.color_hex : '#000000'}
+                              onChange={(e) => setSp({ color_hex: e.target.value })}
+                              className="w-6 h-6 bg-transparent"
+                              title="Color"
+                            />
+                            <input value={sp.material} onChange={(e) => setSp({ material: e.target.value })} aria-label="Material" className="bg-slate-900 p-1.5 rounded min-w-0" />
+                            <input value={sp.color_name} onChange={(e) => setSp({ color_name: e.target.value })} aria-label="Color name" className="bg-slate-900 p-1.5 rounded min-w-0" />
+                            <input type="number" value={sp.initial_weight_g} onChange={(e) => setSp({ initial_weight_g: e.target.value })} aria-label="Grams" className="bg-slate-900 p-1.5 rounded min-w-0" />
+                            <input type="number" step="0.01" value={sp.purchase_price} onChange={(e) => setSp({ purchase_price: e.target.value })} aria-label="Spool price" className="bg-slate-900 p-1.5 rounded min-w-0" />
+                          </div>
+                        );
+                      })}
+
+                      {receiptDraft.parts.length > 0 && <p className="text-slate-300 font-semibold">Parts & other items</p>}
+                      {receiptDraft.parts.map((pt, idx) => {
+                        const setPt = (patch: Partial<ReceiptDraft['parts'][number]>) =>
+                          setReceiptDraft({
+                            ...receiptDraft,
+                            parts: receiptDraft.parts.map((x, i) => (i === idx ? { ...x, ...patch } : x)),
+                          });
+                        return (
+                          <div
+                            key={pt.id}
+                            className="grid grid-cols-[2fr_1.3fr_1fr] items-center gap-1.5 bg-slate-950 p-2 rounded-lg border border-slate-800"
+                          >
+                            <input value={pt.name} onChange={(e) => setPt({ name: e.target.value })} aria-label="Item name" className="bg-slate-900 p-1.5 rounded min-w-0" />
+                            <select
+                              value={pt.category}
+                              onChange={(e) => setPt({ category: e.target.value as PartCategory })}
+                              aria-label="Category"
+                              className="bg-slate-900 p-1.5 rounded min-w-0"
+                            >
+                              {PART_CATEGORIES.map((c) => (
+                                <option key={c} value={c}>
+                                  {PART_CATEGORY_LABELS[c]}
+                                </option>
+                              ))}
+                            </select>
+                            <input type="number" step="0.01" min="0" value={pt.price} onChange={(e) => setPt({ price: e.target.value })} aria-label="Item price" className="bg-slate-900 p-1.5 rounded min-w-0" />
+                          </div>
+                        );
+                      })}
+                      <p className="text-[11px] text-slate-500">
+                        Who paid applies to every item on this receipt. Changing a spool's price also updates the cost of
+                        prints already made with it. Splits are changed with the dropdown on each item (outside edit mode).
+                      </p>
+                      <div className="grid grid-cols-2 gap-2">
+                        <button
+                          onClick={() => setReceiptDraft(null)}
+                          className="bg-slate-800 hover:bg-slate-700 rounded-lg py-2 text-sm font-semibold"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          onClick={saveReceiptEdit}
+                          disabled={saving}
+                          className="bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-white rounded-lg py-2 text-sm font-semibold"
+                        >
+                          Save changes
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                  {isOpen && receiptDraft?.id !== rec.id && (
                     <div className="border-t border-slate-800 p-3 space-y-2">
                       {recSpools.map((sp) => (
                         <div key={sp.id} className="bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-xs">
@@ -1076,6 +1525,7 @@ export default function SpoolSplitApp() {
                             compact
                             onChange={(split) => updatePartSplit(pt, split)}
                           />
+                          {renderLifecycle(pt)}
                         </div>
                       ))}
                       {recSpools.length + recParts.length === 0 && (
@@ -1085,6 +1535,13 @@ export default function SpoolSplitApp() {
                         <span className="text-[11px] text-slate-500">
                           Items {money(itemsTotal)} (tax & shipping spread over items)
                         </span>
+                        <span className="flex items-center gap-3">
+                        <button
+                          onClick={() => startEditReceipt(rec, recSpools, recParts)}
+                          className="flex items-center gap-1 text-xs text-emerald-400 font-medium"
+                        >
+                          <Pencil className="w-3.5 h-3.5" /> Edit
+                        </button>
                         {rec.file_path && (
                           <button
                             onClick={() => viewReceiptFile(rec)}
@@ -1093,6 +1550,7 @@ export default function SpoolSplitApp() {
                             <ExternalLink className="w-3.5 h-3.5" /> View original
                           </button>
                         )}
+                        </span>
                       </div>
                     </div>
                   )}
@@ -1152,10 +1610,10 @@ export default function SpoolSplitApp() {
               <h3 className="text-sm font-semibold">Parts & Upkeep</h3>
             </div>
             <p className="text-xs text-slate-400">
-              By default, nozzles, tubes, plates and other parts are split by print time: each person pays their
-              share of the hours printed since the part was bought, until the next settle-up locks it. You can
-              change any item to 50/50, personal, or a custom %. All-time print
-              time:{' '}
+              Printer parts (nozzles, tubes, plates…) are pre-paid by whoever buys them. Tap Installed when one goes
+              in and Replaced when it comes out: its price is then split by each person's print time in between.
+              Other items are personal for the buyer by default. Any item can be changed to 50/50, personal or a
+              custom %. All-time print time:{' '}
               {users
                 .map((u) => `${u.name} ${formatMinutes(printTimeTotals[u.id] || 0)}`)
                 .join(' • ')}
@@ -1196,15 +1654,16 @@ export default function SpoolSplitApp() {
                           />
                         </div>
                       )}
-                      {users.length >= 2 && (
+                      {users.length >= 2 && split?.manual && (
                         <p className="text-xs text-slate-500 mt-0.5">
-                          {split?.manual ? 'Split:' : split?.frozen ? 'Split (locked at settle-up):' : 'Split so far:'}{' '}
+                          Split:{' '}
                           {users
                             .slice(0, 2)
                             .map((u) => `${u.name} ${Math.round((shares[u.id] || 0) * 100)}%`)
                             .join(' / ')}
                         </p>
                       )}
+                      {renderLifecycle(pt)}
                     </div>
                     <div className="flex items-center gap-3 shrink-0">
                       <span className="text-sm font-bold text-emerald-400">{money(Number(pt.price))}</span>
@@ -1373,6 +1832,33 @@ export default function SpoolSplitApp() {
             </div>
           </div>
 
+          {/* Pre-paid parts: not in the balance until they're replaced */}
+          {wallet.pendingParts.length > 0 && (
+            <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-2">
+              <h3 className="text-sm font-semibold flex items-center gap-2">
+                <Wrench className="w-4 h-4 text-emerald-400" /> Pre-paid parts (charged when replaced)
+              </h3>
+              {wallet.pendingParts.map((pp) => (
+                <div key={pp.part.id} className="flex items-start justify-between gap-3 text-xs">
+                  <span className="text-slate-300 min-w-0">
+                    {userName(pp.part.paid_by_user_id)}&apos;s {pp.part.name}{' '}
+                    <span className="text-slate-500">
+                      {pp.status === 'spare'
+                        ? '— spare, not installed'
+                        : `— installed since ${new Date(`${pp.sinceDate}T00:00:00`).toLocaleDateString()}, ${userName(
+                            pp.owedBy
+                          )}'s share so far ≈ ${money(pp.estimatedOwed)}`}
+                    </span>
+                  </span>
+                  <span className="font-semibold shrink-0">{money(Number(pp.part.price))}</span>
+                </div>
+              ))}
+              <p className="text-[11px] text-slate-500">
+                Mark parts Installed / Replaced under Purchases. Not included in the settle-up amount yet.
+              </p>
+            </div>
+          )}
+
           {/* 3. Full history, grouped by settle-up */}
           <div className="space-y-4">
             <h3 className="text-sm font-semibold">History</h3>
@@ -1504,7 +1990,13 @@ export default function SpoolSplitApp() {
                 <label className="text-xs text-slate-400">Who paid this bill?</label>
                 <select
                   value={receiptPaidBy}
-                  onChange={(e) => setReceiptPaidBy(e.target.value)}
+                  onChange={(e) => {
+                    const payer = e.target.value;
+                    setReceiptPaidBy(payer);
+                    setStagedParts((prev) =>
+                      prev.map((pt) => (pt.splitAuto ? { ...pt, split: defaultSplitFor(pt.category, payer) } : pt))
+                    );
+                  }}
                   className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-sm mt-1"
                 >
                   {users.map((u) => (
@@ -1617,7 +2109,13 @@ export default function SpoolSplitApp() {
                     />
                     <select
                       value={pt.category}
-                      onChange={(e) => updateStagedPart(idx, { category: e.target.value as PartCategory })}
+                      onChange={(e) => {
+                        const category = e.target.value as PartCategory;
+                        updateStagedPart(idx, {
+                          category,
+                          ...(pt.splitAuto ? { split: defaultSplitFor(category, receiptPaidBy || activeUserId) } : {}),
+                        });
+                      }}
                       className="bg-slate-900 p-1.5 rounded min-w-0"
                     >
                       {PART_CATEGORIES.map((c) => (
@@ -1646,13 +2144,23 @@ export default function SpoolSplitApp() {
                   <SplitPicker
                     value={pt.split}
                     users={users}
-                    onChange={(split) => updateStagedPart(idx, { split })}
+                    onChange={(split) => updateStagedPart(idx, { split, splitAuto: false })}
                   />
+                  {pt.split.mode === 'default' && (
+                    <label className="flex items-center gap-1.5 text-[11px] text-slate-400">
+                      <input
+                        type="checkbox"
+                        checked={pt.installedNow}
+                        onChange={(e) => updateStagedPart(idx, { installedNow: e.target.checked })}
+                      />
+                      Installed now (starts its usage clock on the purchase date; leave off for spares)
+                    </label>
+                  )}
                   </div>
                 ))}
               </div>
               <button
-                onClick={() => setStagedParts([...stagedParts, newStagedPart()])}
+                onClick={() => setStagedParts([...stagedParts, newStagedPart(receiptPaidBy || activeUserId)])}
                 className="text-xs text-emerald-400 font-medium"
               >
                 + Add Part Row

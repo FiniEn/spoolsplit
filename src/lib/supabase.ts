@@ -109,6 +109,10 @@ export interface Part {
   personal_user_id?: string | null;
   /** For 'custom': the share (0..1) the buyer covers; the other person owes the rest. */
   payer_share?: number | null;
+  /** Default-split parts: the buyer pre-pays; print time between these dates decides the split. */
+  installed_at?: string | null; // YYYY-MM-DD; null = spare, not installed yet
+  retired_at?: string | null; // YYYY-MM-DD; set when replaced -> the split is charged
+
   created_at: string;
 }
 

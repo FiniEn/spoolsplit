@@ -1,20 +1,45 @@
 import { NextResponse } from 'next/server';
-import { GoogleGenAI, Type } from '@google/genai';
+import { Type } from '@google/genai';
+import { generateJsonWithFallback, readableGeminiError } from '@/lib/gemini';
+import { supabase } from '@/lib/supabase';
+
+/** Files bigger than this are rejected before being sent to Gemini (its inline limit is ~20 MB). */
+const MAX_FILE_BYTES = 15 * 1024 * 1024;
+
+// Retries and model fallbacks can take a while; allow up to a minute on Vercel.
+export const maxDuration = 60;
 
 export async function POST(request: Request) {
   try {
-    const { fileBase64, mimeType, rawText } = await request.json();
+    const { fileBase64: inlineBase64, mimeType, rawText, storagePath } = await request.json();
     if (!process.env.GEMINI_API_KEY) {
       return NextResponse.json({ error: 'GEMINI_API_KEY is not configured on the server' }, { status: 500 });
+    }
+    let fileBase64: string | undefined = inlineBase64;
+    // Large files are uploaded to Supabase Storage by the browser first (Vercel caps request
+    // bodies at 4.5 MB); fetch them from there.
+    if (!fileBase64 && storagePath) {
+      if (typeof storagePath !== 'string' || !/^uploads\/[0-9a-f-]{36}\.[a-z0-9]{1,8}$/.test(storagePath)) {
+        return NextResponse.json({ error: 'Invalid upload path' }, { status: 400 });
+      }
+      const { data, error } = await supabase.storage.from('receipts').download(storagePath);
+      if (error || !data) {
+        return NextResponse.json(
+          { error: `Could not read the uploaded receipt from storage: ${error?.message || 'not found'}` },
+          { status: 502 }
+        );
+      }
+      if (data.size > MAX_FILE_BYTES) {
+        return NextResponse.json({ error: 'File is too large (max 15 MB)' }, { status: 413 });
+      }
+      fileBase64 = Buffer.from(await data.arrayBuffer()).toString('base64');
     }
     if (!fileBase64 && !rawText) {
       return NextResponse.json({ error: 'Provide a file or some text to parse' }, { status: 400 });
     }
-    // ~10 MB of base64 is plenty for a screenshot or receipt PDF
-    if (fileBase64 && fileBase64.length > 14_000_000) {
-      return NextResponse.json({ error: 'File is too large (max ~10 MB)' }, { status: 413 });
+    if (fileBase64 && fileBase64.length > (MAX_FILE_BYTES * 4) / 3) {
+      return NextResponse.json({ error: 'File is too large (max 15 MB)' }, { status: 413 });
     }
-    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
     const parts: any[] = [
       {
@@ -40,12 +65,9 @@ export async function POST(request: Request) {
       parts.push({ text: `Order text:\n${rawText}` });
     }
 
-    const response = await ai.models.generateContent({
-      model: process.env.GEMINI_MODEL || 'gemini-3.8-flash',
-      contents: [{ role: 'user', parts }],
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
+    const { data } = await generateJsonWithFallback({
+      parts,
+      responseSchema: {
           type: Type.OBJECT,
           properties: {
             vendor: { type: Type.STRING },
@@ -93,15 +115,12 @@ export async function POST(request: Request) {
             },
           },
           required: ['vendor', 'spools', 'parts', 'grand_total'],
-        },
       },
     });
-
-    const data = JSON.parse(response.text || '{}');
     return NextResponse.json(data);
   } catch (err: any) {
     return NextResponse.json(
-      { error: err.message || 'Failed to parse receipt' },
+      { error: readableGeminiError(err) || 'Failed to parse receipt' },
       { status: 500 }
     );
   }
