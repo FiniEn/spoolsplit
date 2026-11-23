@@ -38,6 +38,7 @@ import {
   ExternalLink,
   FileText,
   Lock,
+  Pencil,
 } from 'lucide-react';
 
 type StagedSpool = {
@@ -149,6 +150,25 @@ function SplitPicker({
 
 type UsageDraft = { spool_id: string; grams_used: number };
 
+/** Editable copy of a saved receipt and its items (string fields = form inputs). */
+type ReceiptDraft = {
+  id: string;
+  vendor: string;
+  purchased_at: string;
+  paid_by_user_id: string;
+  total: string;
+  spools: {
+    id: string;
+    brand: string;
+    material: string;
+    color_name: string;
+    color_hex: string;
+    initial_weight_g: string;
+    purchase_price: string;
+  }[];
+  parts: { id: string; name: string; category: PartCategory; price: string }[];
+};
+
 const newStagedPart = (overrides: Partial<StagedPart> = {}): StagedPart => ({
   name: '',
   category: 'nozzle',
@@ -213,6 +233,7 @@ export default function SpoolSplitApp() {
   const [parts, setParts] = useState<Part[]>([]);
   const [receipts, setReceipts] = useState<ReceiptRecord[]>([]);
   const [openReceiptId, setOpenReceiptId] = useState<string | null>(null);
+  const [receiptDraft, setReceiptDraft] = useState<ReceiptDraft | null>(null);
   const [activeTab, setActiveTab] = useState<'prints' | 'spools' | 'settle'>('prints');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -577,6 +598,136 @@ export default function SpoolSplitApp() {
         setReceiptTotal(null);
         if (uploadWarning) setErrorMsg(uploadWarning);
         setShowReceiptModal(false);
+        await fetchAllData();
+      } finally {
+        setSaving(false);
+      }
+    });
+
+  const startEditReceipt = (rec: ReceiptRecord, recSpools: Spool[], recParts: Part[]) =>
+    setReceiptDraft({
+      id: rec.id,
+      vendor: rec.vendor || '',
+      purchased_at: rec.purchased_at.slice(0, 10),
+      paid_by_user_id: rec.paid_by_user_id,
+      total: Number(rec.total).toFixed(2),
+      spools: recSpools.map((sp) => ({
+        id: sp.id,
+        brand: sp.brand,
+        material: sp.material,
+        color_name: sp.color_name,
+        color_hex: sp.color_hex,
+        initial_weight_g: String(Number(sp.initial_weight_g)),
+        purchase_price: Number(sp.purchase_price).toFixed(2),
+      })),
+      parts: recParts.map((pt) => ({ id: pt.id, name: pt.name, category: pt.category, price: Number(pt.price).toFixed(2) })),
+    });
+
+  /**
+   * Saves an edited receipt: the receipt, every item on it (who paid follows the receipt), and,
+   * when a spool's price or weight changed, the cost of prints already made from that spool.
+   */
+  const saveReceiptEdit = () =>
+    run(async () => {
+      const d = receiptDraft;
+      if (!d) return;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(d.purchased_at)) throw new Error('Pick the purchase date');
+      if (!users.some((u) => u.id === d.paid_by_user_id)) throw new Error('Pick who paid');
+      const total = Number(d.total);
+      if (d.total === '' || !(total >= 0)) throw new Error('Enter a valid total');
+      for (const sp of d.spools) {
+        if (!(Number(sp.initial_weight_g) > 0)) throw new Error(`Spool "${sp.color_name}" needs a weight above 0 g`);
+        if (sp.purchase_price === '' || !(Number(sp.purchase_price) >= 0))
+          throw new Error(`Spool "${sp.color_name}" needs a valid price`);
+      }
+      for (const pt of d.parts) {
+        if (!pt.name.trim()) throw new Error('Every part needs a name');
+        if (pt.price === '' || !(Number(pt.price) >= 0)) throw new Error(`Part "${pt.name}" needs a valid price`);
+      }
+      setSaving(true);
+      try {
+        check(
+          await supabase
+            .from('receipts')
+            .update({
+              vendor: d.vendor.trim(),
+              purchased_at: d.purchased_at,
+              paid_by_user_id: d.paid_by_user_id,
+              total: Number(total.toFixed(2)),
+            })
+            .eq('id', d.id)
+        );
+
+        // New cost per print-usage row for every spool whose price per gram changed
+        const newCostByUsage = new Map<string, number>();
+        for (const sp of d.spools) {
+          const before = allSpools.find((x) => x.id === sp.id);
+          const weight = Number(sp.initial_weight_g);
+          const price = Number(Number(sp.purchase_price).toFixed(2));
+          check(
+            await supabase
+              .from('spools')
+              .update({
+                brand: sp.brand.trim(),
+                material: sp.material.trim(),
+                color_name: sp.color_name.trim(),
+                color_hex: sp.color_hex,
+                initial_weight_g: weight,
+                remaining_weight_g: weight,
+                purchase_price: price,
+                paid_by_user_id: d.paid_by_user_id,
+              })
+              .eq('id', sp.id)
+          );
+          if (before && (Number(before.purchase_price) !== price || Number(before.initial_weight_g) !== weight)) {
+            for (const pr of prints) {
+              for (const u of pr.print_spool_usages || []) {
+                if (u.spool_id === sp.id && u.id) {
+                  newCostByUsage.set(u.id, Number((Number(u.grams_used) * (price / weight)).toFixed(2)));
+                }
+              }
+            }
+          }
+        }
+        // Re-cost the prints that already used a changed spool
+        if (newCostByUsage.size > 0) {
+          for (const [usageId, cost] of newCostByUsage) {
+            check(await supabase.from('print_spool_usages').update({ calculated_cost: cost }).eq('id', usageId));
+          }
+          for (const pr of prints) {
+            const usages = pr.print_spool_usages || [];
+            if (!usages.some((u) => u.id && newCostByUsage.has(u.id))) continue;
+            const totalCost = usages.reduce(
+              (sum, u) => sum + (u.id && newCostByUsage.has(u.id) ? newCostByUsage.get(u.id)! : Number(u.calculated_cost || 0)),
+              0
+            );
+            check(await supabase.from('prints').update({ total_cost: Number(totalCost.toFixed(2)) }).eq('id', pr.id));
+          }
+        }
+
+        for (const pt of d.parts) {
+          const before = parts.find((x) => x.id === pt.id);
+          const payerChanged = before && before.paid_by_user_id !== d.paid_by_user_id;
+          // A custom % is stored as the buyer's share; keep the same person-to-person split if the buyer changes
+          const payerShare =
+            before?.split_mode === 'custom' && before.payer_share != null && payerChanged
+              ? Number((1 - Number(before.payer_share)).toFixed(4))
+              : before?.payer_share ?? null;
+          check(
+            await supabase
+              .from('parts')
+              .update({
+                name: pt.name.trim(),
+                category: pt.category,
+                price: Number(Number(pt.price).toFixed(2)),
+                paid_by_user_id: d.paid_by_user_id,
+                purchased_at: d.purchased_at,
+                ...(before?.split_mode === 'custom' ? { payer_share: payerShare } : {}),
+              })
+              .eq('id', pt.id)
+          );
+        }
+        setReceiptDraft(null);
         await fetchAllData();
       } finally {
         setSaving(false);
@@ -1082,7 +1233,133 @@ export default function SpoolSplitApp() {
                       <ChevronDown className={`w-4 h-4 text-slate-400 transition ${isOpen ? 'rotate-180' : ''}`} />
                     </div>
                   </button>
-                  {isOpen && (
+                  {isOpen && receiptDraft?.id === rec.id && (
+                    <div className="border-t border-slate-800 p-3 space-y-3 text-xs">
+                      <div className="grid grid-cols-2 gap-2">
+                        <label className="space-y-1">
+                          <span className="text-slate-400">Who paid</span>
+                          <select
+                            value={receiptDraft.paid_by_user_id}
+                            onChange={(e) => setReceiptDraft({ ...receiptDraft, paid_by_user_id: e.target.value })}
+                            className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-sm"
+                          >
+                            {users.map((u) => (
+                              <option key={u.id} value={u.id}>
+                                {u.name}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="space-y-1">
+                          <span className="text-slate-400">Purchase date</span>
+                          <input
+                            type="date"
+                            value={receiptDraft.purchased_at}
+                            onChange={(e) => setReceiptDraft({ ...receiptDraft, purchased_at: e.target.value })}
+                            className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-sm"
+                          />
+                        </label>
+                        <label className="space-y-1">
+                          <span className="text-slate-400">Store</span>
+                          <input
+                            value={receiptDraft.vendor}
+                            onChange={(e) => setReceiptDraft({ ...receiptDraft, vendor: e.target.value })}
+                            className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-sm"
+                          />
+                        </label>
+                        <label className="space-y-1">
+                          <span className="text-slate-400">Receipt total ($)</span>
+                          <input
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            value={receiptDraft.total}
+                            onChange={(e) => setReceiptDraft({ ...receiptDraft, total: e.target.value })}
+                            className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-sm"
+                          />
+                        </label>
+                      </div>
+
+                      {receiptDraft.spools.length > 0 && (
+                        <p className="text-slate-300 font-semibold">Spools (material, color, grams, $)</p>
+                      )}
+                      {receiptDraft.spools.map((sp, idx) => {
+                        const setSp = (patch: Partial<ReceiptDraft['spools'][number]>) =>
+                          setReceiptDraft({
+                            ...receiptDraft,
+                            spools: receiptDraft.spools.map((x, i) => (i === idx ? { ...x, ...patch } : x)),
+                          });
+                        return (
+                          <div
+                            key={sp.id}
+                            className="grid grid-cols-[auto_1fr_1fr_1fr_1fr] items-center gap-1.5 bg-slate-950 p-2 rounded-lg border border-slate-800"
+                          >
+                            <input
+                              type="color"
+                              value={/^#[0-9a-fA-F]{6}$/.test(sp.color_hex) ? sp.color_hex : '#000000'}
+                              onChange={(e) => setSp({ color_hex: e.target.value })}
+                              className="w-6 h-6 bg-transparent"
+                              title="Color"
+                            />
+                            <input value={sp.material} onChange={(e) => setSp({ material: e.target.value })} aria-label="Material" className="bg-slate-900 p-1.5 rounded min-w-0" />
+                            <input value={sp.color_name} onChange={(e) => setSp({ color_name: e.target.value })} aria-label="Color name" className="bg-slate-900 p-1.5 rounded min-w-0" />
+                            <input type="number" value={sp.initial_weight_g} onChange={(e) => setSp({ initial_weight_g: e.target.value })} aria-label="Grams" className="bg-slate-900 p-1.5 rounded min-w-0" />
+                            <input type="number" step="0.01" value={sp.purchase_price} onChange={(e) => setSp({ purchase_price: e.target.value })} aria-label="Spool price" className="bg-slate-900 p-1.5 rounded min-w-0" />
+                          </div>
+                        );
+                      })}
+
+                      {receiptDraft.parts.length > 0 && <p className="text-slate-300 font-semibold">Parts & other items</p>}
+                      {receiptDraft.parts.map((pt, idx) => {
+                        const setPt = (patch: Partial<ReceiptDraft['parts'][number]>) =>
+                          setReceiptDraft({
+                            ...receiptDraft,
+                            parts: receiptDraft.parts.map((x, i) => (i === idx ? { ...x, ...patch } : x)),
+                          });
+                        return (
+                          <div
+                            key={pt.id}
+                            className="grid grid-cols-[2fr_1.3fr_1fr] items-center gap-1.5 bg-slate-950 p-2 rounded-lg border border-slate-800"
+                          >
+                            <input value={pt.name} onChange={(e) => setPt({ name: e.target.value })} aria-label="Item name" className="bg-slate-900 p-1.5 rounded min-w-0" />
+                            <select
+                              value={pt.category}
+                              onChange={(e) => setPt({ category: e.target.value as PartCategory })}
+                              aria-label="Category"
+                              className="bg-slate-900 p-1.5 rounded min-w-0"
+                            >
+                              {PART_CATEGORIES.map((c) => (
+                                <option key={c} value={c}>
+                                  {PART_CATEGORY_LABELS[c]}
+                                </option>
+                              ))}
+                            </select>
+                            <input type="number" step="0.01" min="0" value={pt.price} onChange={(e) => setPt({ price: e.target.value })} aria-label="Item price" className="bg-slate-900 p-1.5 rounded min-w-0" />
+                          </div>
+                        );
+                      })}
+                      <p className="text-[11px] text-slate-500">
+                        Who paid applies to every item on this receipt. Changing a spool's price also updates the cost of
+                        prints already made with it. Splits are changed with the dropdown on each item (outside edit mode).
+                      </p>
+                      <div className="grid grid-cols-2 gap-2">
+                        <button
+                          onClick={() => setReceiptDraft(null)}
+                          className="bg-slate-800 hover:bg-slate-700 rounded-lg py-2 text-sm font-semibold"
+                        >
+                          Cancel
+                        </button>
+                        <button
+                          onClick={saveReceiptEdit}
+                          disabled={saving}
+                          className="bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-white rounded-lg py-2 text-sm font-semibold"
+                        >
+                          Save changes
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                  {isOpen && receiptDraft?.id !== rec.id && (
                     <div className="border-t border-slate-800 p-3 space-y-2">
                       {recSpools.map((sp) => (
                         <div key={sp.id} className="bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-xs">
@@ -1125,6 +1402,13 @@ export default function SpoolSplitApp() {
                         <span className="text-[11px] text-slate-500">
                           Items {money(itemsTotal)} (tax & shipping spread over items)
                         </span>
+                        <span className="flex items-center gap-3">
+                        <button
+                          onClick={() => startEditReceipt(rec, recSpools, recParts)}
+                          className="flex items-center gap-1 text-xs text-emerald-400 font-medium"
+                        >
+                          <Pencil className="w-3.5 h-3.5" /> Edit
+                        </button>
                         {rec.file_path && (
                           <button
                             onClick={() => viewReceiptFile(rec)}
@@ -1133,6 +1417,7 @@ export default function SpoolSplitApp() {
                             <ExternalLink className="w-3.5 h-3.5" /> View original
                           </button>
                         )}
+                        </span>
                       </div>
                     </div>
                   )}
