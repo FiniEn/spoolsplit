@@ -1,9 +1,13 @@
 import { NextResponse } from 'next/server';
-import { GoogleGenAI, Type } from '@google/genai';
+import { Type } from '@google/genai';
+import { generateJsonWithFallback, readableGeminiError } from '@/lib/gemini';
 import { supabase } from '@/lib/supabase';
 
 /** Files bigger than this are rejected before being sent to Gemini (its inline limit is ~20 MB). */
 const MAX_FILE_BYTES = 15 * 1024 * 1024;
+
+// Retries and model fallbacks can take a while; allow up to a minute on Vercel.
+export const maxDuration = 60;
 
 export async function POST(request: Request) {
   try {
@@ -36,7 +40,6 @@ export async function POST(request: Request) {
     if (fileBase64 && fileBase64.length > (MAX_FILE_BYTES * 4) / 3) {
       return NextResponse.json({ error: 'File is too large (max 15 MB)' }, { status: 413 });
     }
-    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
     const parts: any[] = [
       {
@@ -62,12 +65,9 @@ export async function POST(request: Request) {
       parts.push({ text: `Order text:\n${rawText}` });
     }
 
-    const response = await ai.models.generateContent({
-      model: process.env.GEMINI_MODEL || 'gemini-3.8-flash',
-      contents: [{ role: 'user', parts }],
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
+    const { data } = await generateJsonWithFallback({
+      parts,
+      responseSchema: {
           type: Type.OBJECT,
           properties: {
             vendor: { type: Type.STRING },
@@ -115,29 +115,13 @@ export async function POST(request: Request) {
             },
           },
           required: ['vendor', 'spools', 'parts', 'grand_total'],
-        },
       },
     });
-
-    const data = JSON.parse(response.text || '{}');
     return NextResponse.json(data);
   } catch (err: any) {
     return NextResponse.json(
-      { error: readableError(err) || 'Failed to parse receipt' },
+      { error: readableGeminiError(err) || 'Failed to parse receipt' },
       { status: 500 }
     );
   }
-}
-
-/** Gemini errors arrive as a JSON string; pull out the human-readable message. */
-function readableError(err: any): string {
-  const raw = String(err?.message || '');
-  try {
-    const parsed = JSON.parse(raw);
-    const msg = parsed?.error?.message || parsed?.message;
-    if (msg) return `Gemini: ${msg}`;
-  } catch {
-    // not JSON
-  }
-  return raw;
 }

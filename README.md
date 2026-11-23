@@ -9,6 +9,7 @@ A small web app for two people sharing a Bambu Lab 3D printer. It tracks what ea
 - **Settle up:** the Wallet tab shows the one payment that settles everything ("Fini pays Mike $8.67"). Recording it closes the period, which also locks the print-time split of any parts bought before it. You can still record partial payments.
 - **Receipts:** every saved purchase keeps its full item list and the original image or PDF ("View original"), under **Purchases → Receipts**. Spools are always pay-per-use. Every other item can be split **by print time** (the default), **50/50**, **only for Fini / Mike** (personal), or a **custom %**, when you add it or any time later. A manual split is charged right away instead of waiting for print time.
 - **History:** every purchase, print, part and payment is listed with what it changed and the balance after it, grouped by settle-up.
+- **AI model:** receipts and screenshots are read by Gemini (`gemini-3.8-flash`, or `GEMINI_MODEL`). If it answers "high demand", the app retries and then falls back to `gemini-3.5-flash` and `gemini-3.5-flash-lite` (change the list with `GEMINI_FALLBACK_MODELS`).
 - **CSV export** of the full wallet history.
 
 ## Setup
