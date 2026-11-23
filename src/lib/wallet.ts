@@ -1,5 +1,5 @@
 import type { Part, PrintJob, Settlement, Spool, User } from './supabase';
-import { formatMinutes } from './split';
+import { formatMinutes, printMinutesByUser } from './split';
 
 /**
  * Wallet model: whoever buys something pays from their own pocket. When you use something the
@@ -51,9 +51,28 @@ export interface PersonSummary {
 
 export interface PartSplitInfo {
   shares: Record<string, number>;
-  frozen: boolean;
+  /**
+   * manual  = split chosen by hand, charged at purchase
+   * spare   = default split, not installed yet (nothing owed)
+   * pending = installed, split so far (charged when replaced)
+   * final   = replaced, lifetime split charged
+   */
+  lifetime: 'manual' | 'spare' | 'pending' | 'final';
   /** True when the split was chosen by hand (50/50, personal or custom). */
   manual?: boolean;
+  /** Print minutes per user that decided the split (default-split parts). */
+  minutes?: Record<string, number>;
+}
+
+/** A pre-paid part that isn't settled yet (spare or still installed). */
+export interface PendingPart {
+  part: Part;
+  status: 'spare' | 'installed';
+  sinceDate: string | null;
+  shares: Record<string, number>;
+  /** What the non-buyer would owe if it were replaced today. */
+  estimatedOwed: number;
+  owedBy: string;
 }
 
 export interface WalletResult {
@@ -64,6 +83,8 @@ export interface WalletResult {
   /** Newest first: the open period, then closed periods. */
   periods: WalletPeriod[];
   partSplit: Map<string, PartSplitInfo>;
+  /** Pre-paid parts still in use or on the shelf: not in the balance yet. */
+  pendingParts: PendingPart[];
   /** Totals for the open period (since the last settle-up). */
   summary: PersonSummary[];
 }
@@ -73,14 +94,9 @@ const SETTLED_EPSILON = 0.01;
 type Ev =
   | { ts: string; order: number; kind: 'spool'; spool: Spool }
   | { ts: string; order: number; kind: 'part'; part: Part }
+  | { ts: string; order: number; kind: 'retire'; part: Part }
   | { ts: string; order: number; kind: 'print'; print: PrintJob }
   | { ts: string; order: number; kind: 'payment'; st: Settlement };
-
-interface OpenPart {
-  part: Part;
-  minutes: Record<string, number>;
-  entry: WalletEntry;
-}
 
 export function computeWallet(input: {
   users: User[];
@@ -97,6 +113,7 @@ export function computeWallet(input: {
     creditorId: '',
     periods: [{ entries: [] }],
     partSplit: new Map(),
+    pendingParts: [],
     summary: users.map((u) => newSummary(u.id)),
   };
   if (users.length < 2) return empty;
@@ -110,6 +127,10 @@ export function computeWallet(input: {
   const events: Ev[] = [
     ...spools.map((spool): Ev => ({ ts: spool.created_at, order: 0, kind: 'spool', spool })),
     ...parts.map((part): Ev => ({ ts: `${part.purchased_at.slice(0, 10)}T00:00:00.000Z`, order: 0, kind: 'part', part })),
+    // A default-split part is charged at the end of the day it was replaced
+    ...parts
+      .filter((part) => !manualShares(part, A, B) && part.retired_at)
+      .map((part): Ev => ({ ts: `${part.retired_at!.slice(0, 10)}T23:59:59.999Z`, order: 1, kind: 'retire', part })),
     ...prints.map((print): Ev => ({ ts: print.created_at, order: 1, kind: 'print', print })),
     ...settlements.map((st): Ev => ({ ts: st.settled_at, order: 2, kind: 'payment', st })),
   ];
@@ -120,8 +141,7 @@ export function computeWallet(input: {
   });
 
   // --- Replay ---------------------------------------------------------------------------------
-  let fixed = 0; // everything except still-open parts
-  let open: OpenPart[] = [];
+  let fixed = 0;
   const partSplit = new Map<string, PartSplitInfo>();
   const periods: WalletPeriod[] = [];
   let current: WalletEntry[] = [];
@@ -138,24 +158,15 @@ export function computeWallet(input: {
     if (part.paid_by_user_id === A) return -price * shares[B];
     return 0;
   };
-  const openValue = () => open.reduce((sum, op) => sum + partValue(op.part, sharesOf(op.minutes)), 0);
   const pct = (shares: Record<string, number>) =>
     `${name(A)} ${Math.round(shares[A] * 100)}% / ${name(B)} ${Math.round(shares[B] * 100)}%`;
-
-  /** Value every open part with its current split and write the numbers into its entry. */
-  const settleOpenParts = (freeze: boolean) => {
-    for (const op of open) {
-      const shares = sharesOf(op.minutes);
-      const value = partValue(op.part, shares);
-      op.entry.delta = value;
-      op.entry.detail = `${money(Number(op.part.price))} • split by print time: ${pct(shares)}${freeze ? ' (locked)' : ' (so far)'}`;
-      partSplit.set(op.part.id, { shares, frozen: freeze });
-      const payer = op.part.paid_by_user_id;
-      const other = payer === A ? B : payer === B ? A : '';
-      if (other) summary[other].partsShareOwed += Number(op.part.price || 0) * shares[other];
-      if (freeze) fixed += value;
-    }
-    if (freeze) open = [];
+  const otherOf = (payer: string) => (payer === A ? B : payer === B ? A : '');
+  /** Print minutes and shares between install and replacement (or today). */
+  const lifetimeSplit = (part: Part) => {
+    const since = (part.installed_at || part.purchased_at).slice(0, 10);
+    const until = part.retired_at ? part.retired_at.slice(0, 10) : undefined;
+    const minutes = printMinutesByUser(prints, [A, B], since, until);
+    return { minutes, shares: sharesOf(minutes) };
   };
 
   for (const ev of events) {
@@ -194,13 +205,34 @@ export function computeWallet(input: {
         entry.delta = value;
         entry.detail = `${money(Number(part.price))} • ${manual.label}`;
         fixed += value;
-        partSplit.set(part.id, { shares: manual.shares, frozen: true, manual: true });
+        partSplit.set(part.id, { shares: manual.shares, lifetime: 'manual', manual: true });
         const other = part.paid_by_user_id === A ? B : part.paid_by_user_id === B ? A : '';
         if (other) summary[other].partsShareOwed += Number(part.price || 0) * manual.shares[other];
       } else {
-        open.push({ part, minutes: { [A]: 0, [B]: 0 }, entry });
+        // Default: the buyer pre-pays; the split is charged when the part is replaced.
+        entry.detail = `${money(Number(part.price))} • pre-paid by ${name(part.paid_by_user_id)}, split by print time when replaced`;
       }
       current.push(entry);
+    } else if (ev.kind === 'retire') {
+      const part = ev.part;
+      const { minutes, shares } = lifetimeSplit(part);
+      const value = partValue(part, shares);
+      fixed += value;
+      const other = otherOf(part.paid_by_user_id);
+      if (other) summary[other].partsShareOwed += Number(part.price || 0) * shares[other];
+      partSplit.set(part.id, { shares, lifetime: 'final', minutes });
+      const total = minutes[A] + minutes[B];
+      current.push({
+        key: `retire-${part.id}`,
+        when: ev.ts,
+        kind: 'part',
+        title: `${part.name} replaced`,
+        detail: `${money(Number(part.price))} • ${total > 0 ? `lifetime ${formatMinutes(total)} of printing: ${pct(shares)}` : 'no printing while installed: split 50/50'}`,
+        delta: value,
+        runningBalance: 0,
+        amount: Number(part.price || 0),
+        partId: part.id,
+      });
     } else if (ev.kind === 'print') {
       const p = ev.print;
       let delta = 0;
@@ -226,16 +258,7 @@ export function computeWallet(input: {
           delta += owner === B ? cost : -cost;
         }
       }
-      // Print time feeds the split of every part that is still open
       const minutes = Math.max(0, Number(p.duration_minutes || 0));
-      for (const op of open) {
-        if (p.is_shared_print) {
-          op.minutes[A] += minutes / 2;
-          op.minutes[B] += minutes / 2;
-        } else if (p.printed_by_user_id === A || p.printed_by_user_id === B) {
-          op.minutes[p.printed_by_user_id] += minutes;
-        }
-      }
       fixed += delta;
       const who = p.is_shared_print ? 'Shared print' : `${name(p.printed_by_user_id)} printed`;
       const ownOnly = delta === 0 && pieces.length > 0 && !p.is_shared_print;
@@ -273,8 +296,7 @@ export function computeWallet(input: {
         settlementId: st.id,
       });
       // A payment that brings the balance to zero is a settle-up: close the books.
-      if (delta !== 0 && Math.abs(fixed + openValue()) < SETTLED_EPSILON) {
-        settleOpenParts(true);
+      if (delta !== 0 && Math.abs(fixed) < SETTLED_EPSILON) {
         fixed = 0; // settled: drop any sub-cent rounding
         periods.push({ closedBy: st, entries: current });
         current = [];
@@ -282,8 +304,29 @@ export function computeWallet(input: {
       }
     }
   }
-  settleOpenParts(false);
   periods.push({ entries: current });
+
+  // Pre-paid parts not replaced yet: shown with an estimate, not in the balance
+  const pendingParts: PendingPart[] = [];
+  for (const part of parts) {
+    if (manualShares(part, A, B) || part.retired_at) continue;
+    const owedBy = otherOf(part.paid_by_user_id);
+    if (!part.installed_at) {
+      partSplit.set(part.id, { shares: { [A]: 0, [B]: 0 }, lifetime: 'spare' });
+      pendingParts.push({ part, status: 'spare', sinceDate: null, shares: { [A]: 0, [B]: 0 }, estimatedOwed: 0, owedBy });
+      continue;
+    }
+    const { minutes, shares } = lifetimeSplit(part);
+    partSplit.set(part.id, { shares, lifetime: 'pending', minutes });
+    pendingParts.push({
+      part,
+      status: 'installed',
+      sinceDate: part.installed_at.slice(0, 10),
+      shares,
+      estimatedOwed: owedBy ? Number(part.price || 0) * shares[owedBy] : 0,
+      owedBy,
+    });
+  }
 
   // Running balances: plain sums of the rows, so the history always adds up to the balance.
   let running = 0;
@@ -304,6 +347,7 @@ export function computeWallet(input: {
     creditorId,
     periods: periods.reverse(),
     partSplit,
+    pendingParts,
     summary: [summary[A], summary[B]],
   };
 }

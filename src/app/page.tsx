@@ -55,6 +55,10 @@ type StagedPart = {
   category: PartCategory;
   price: number | string;
   split: SplitChoice;
+  /** True while the split is the automatic default (follows category and who paid). */
+  splitAuto: boolean;
+  /** Mark as installed on the purchase date when saving (starts its usage clock). */
+  installedNow: boolean;
 };
 
 /**
@@ -118,7 +122,7 @@ function SplitPicker({
         className={`bg-slate-900 border border-slate-800 rounded p-1.5 min-w-0 ${compact ? 'text-[11px]' : 'text-xs'}`}
         aria-label="How to split this item"
       >
-        <option value="default">By print time (default)</option>
+        <option value="default">By lifetime print time (default)</option>
         <option value="even">Split 50/50</option>
         {users.map((u) => (
           <option key={u.id} value={`personal:${u.id}`}>
@@ -169,13 +173,22 @@ type ReceiptDraft = {
   parts: { id: string; name: string; category: PartCategory; price: string }[];
 };
 
-const newStagedPart = (overrides: Partial<StagedPart> = {}): StagedPart => ({
-  name: '',
-  category: 'nozzle',
-  price: '',
-  split: DEFAULT_SPLIT,
-  ...overrides,
-});
+/** Printer parts are pre-paid and split by lifetime print time; "Other item" is personal for the buyer. */
+const defaultSplitFor = (category: PartCategory, payerId: string): SplitChoice =>
+  category === 'other' ? { mode: 'personal', personalUserId: payerId || null, firstUserPct: 50 } : DEFAULT_SPLIT;
+
+const newStagedPart = (payerId: string, overrides: Partial<StagedPart> = {}): StagedPart => {
+  const category = overrides.category || 'nozzle';
+  return {
+    name: '',
+    category,
+    price: '',
+    split: defaultSplitFor(category, payerId),
+    splitAuto: true,
+    installedNow: false,
+    ...overrides,
+  };
+};
 
 /** Today's date as YYYY-MM-DD in the viewer's time zone. */
 const todayIso = () => {
@@ -234,6 +247,8 @@ export default function SpoolSplitApp() {
   const [receipts, setReceipts] = useState<ReceiptRecord[]>([]);
   const [openReceiptId, setOpenReceiptId] = useState<string | null>(null);
   const [receiptDraft, setReceiptDraft] = useState<ReceiptDraft | null>(null);
+  /** Date chosen next to each part's Installed / Replaced button (defaults to today). */
+  const [lifecycleDates, setLifecycleDates] = useState<Record<string, string>>({});
   const [activeTab, setActiveTab] = useState<'prints' | 'spools' | 'settle'>('prints');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -458,7 +473,7 @@ export default function SpoolSplitApp() {
           const category: PartCategory = PART_CATEGORIES.includes(pt.category) ? pt.category : 'other';
           for (let i = 0; i < qty; i++) {
             expandedParts.push(
-              newStagedPart({
+              newStagedPart(receiptPaidBy || activeUserId, {
                 name: pt.name || PART_CATEGORY_LABELS[category],
                 category,
                 price: Number(pt.unit_landed_cost || 0).toFixed(2),
@@ -528,6 +543,7 @@ export default function SpoolSplitApp() {
           paid_by_user_id: paidBy,
           purchased_at: receiptDate,
           ...splitToColumns(pt.split, paidBy, users),
+          ...(pt.installedNow && pt.split.mode === 'default' ? { installed_at: receiptDate } : {}),
         };
       });
       const itemsTotal =
@@ -582,11 +598,18 @@ export default function SpoolSplitApp() {
           insertedSpoolIds = (res.data || []).map((r: { id: string }) => r.id);
         }
         if (partRows.length > 0) {
-          const partRes = await supabase.from('parts').insert(partRows.map((r) => ({ ...r, receipt_id: receipt.id })));
+          const partRes = await supabase
+            .from('parts')
+            .insert(partRows.map((r) => ({ ...r, receipt_id: receipt.id })))
+            .select('id, name, category, installed_at');
           if (partRes.error) {
             // Keep the purchase all-or-nothing so a retry doesn't duplicate anything
             await undo(insertedSpoolIds);
             throw new Error(partRes.error.message);
+          }
+          // Parts installed right away may replace an installed part of the same kind
+          for (const row of (partRes.data || []) as Pick<Part, 'id' | 'name' | 'category' | 'installed_at'>[]) {
+            if (row.installed_at) await promptReplacements(row, row.installed_at);
           }
         }
         setStagedSpools([]);
@@ -754,6 +777,115 @@ export default function SpoolSplitApp() {
       if (win) win.location.href = data.signedUrl;
       else window.location.href = data.signedUrl;
     });
+
+  /** Other installed parts of the same kind that a newly installed part might replace. */
+  const replaceCandidates = (part: Pick<Part, 'id' | 'category'>, pool: Part[] = parts) =>
+    ['other', 'maintenance'].includes(part.category)
+      ? []
+      : pool.filter(
+          (x) =>
+            x.id !== part.id &&
+            x.category === part.category &&
+            (x.split_mode || 'default') === 'default' &&
+            x.installed_at &&
+            !x.retired_at
+        );
+
+  /** Asks, for each installed part of the same kind, whether the new one replaces it. */
+  const promptReplacements = async (part: Pick<Part, 'id' | 'category' | 'name'>, date: string, pool: Part[] = parts) => {
+    for (const old of replaceCandidates(part, pool)) {
+      const since = new Date(`${old.installed_at}T00:00:00`).toLocaleDateString();
+      if (!confirm(`Does "${part.name}" replace "${old.name}" (installed since ${since})?\n\nIt will be marked as replaced and its cost split by the print time while it was installed.`))
+        continue;
+      const retired = old.installed_at && old.installed_at > date ? old.installed_at : date;
+      check(await supabase.from('parts').update({ retired_at: retired }).eq('id', old.id));
+    }
+  };
+
+  const markInstalled = (part: Part) =>
+    run(async () => {
+      const date = lifecycleDates[part.id] || todayIso();
+      check(await supabase.from('parts').update({ installed_at: date, retired_at: null }).eq('id', part.id));
+      await promptReplacements(part, date);
+      await fetchAllData();
+    });
+
+  const markReplaced = (part: Part) =>
+    run(async () => {
+      const date = lifecycleDates[part.id] || todayIso();
+      if (part.installed_at && date < part.installed_at) {
+        throw new Error(`"${part.name}" was installed on ${part.installed_at}; the replacement date can't be earlier.`);
+      }
+      if (!confirm(`Mark "${part.name}" as replaced on ${new Date(`${date}T00:00:00`).toLocaleDateString()}? Its cost will be split by the print time while it was installed.`))
+        return;
+      check(await supabase.from('parts').update({ retired_at: date }).eq('id', part.id));
+      await fetchAllData();
+    });
+
+  /** Undo: replaced -> installed again, or installed -> back to spare. */
+  const undoLifecycle = (part: Part) =>
+    run(async () => {
+      const patch = part.retired_at ? { retired_at: null } : { installed_at: null };
+      check(await supabase.from('parts').update(patch).eq('id', part.id));
+      await fetchAllData();
+    });
+
+  /** Status, estimate and Installed / Replaced controls for a default-split (pre-paid) part. */
+  const renderLifecycle = (pt: Part) => {
+    const info = wallet.partSplit.get(pt.id);
+    if (!info || info.lifetime === 'manual' || users.length < 2) return null;
+    const date = lifecycleDates[pt.id] || todayIso();
+    const owedBy = pt.paid_by_user_id === users[0].id ? users[1] : users[0];
+    const owedAmount = Number(pt.price || 0) * (info.shares[owedBy.id] || 0);
+    const totalMinutes = info.minutes ? (info.minutes[users[0].id] || 0) + (info.minutes[users[1].id] || 0) : 0;
+    const split = users.map((u) => `${u.name} ${Math.round((info.shares[u.id] || 0) * 100)}%`).join(' / ');
+    const fmt = (d?: string | null) => (d ? new Date(`${d.slice(0, 10)}T00:00:00`).toLocaleDateString() : '');
+    const chip =
+      info.lifetime === 'spare'
+        ? { text: 'Spare', cls: 'bg-slate-800 text-slate-300' }
+        : info.lifetime === 'pending'
+          ? { text: `Installed since ${fmt(pt.installed_at)}`, cls: 'bg-sky-500/15 text-sky-300' }
+          : { text: `Replaced ${fmt(pt.retired_at)}`, cls: 'bg-emerald-500/15 text-emerald-300' };
+    return (
+      <div className="mt-1.5 space-y-1.5">
+        <span className={`inline-block text-[11px] font-semibold px-2 py-0.5 rounded-full ${chip.cls}`}>{chip.text}</span>
+        <p className="text-[11px] text-slate-400">
+          {info.lifetime === 'spare' &&
+            `Pre-paid by ${userName(pt.paid_by_user_id)}. Nothing is owed until it's installed and later replaced.`}
+          {info.lifetime === 'pending' &&
+            `So far ${formatMinutes(totalMinutes)} of printing: ${split} → ≈ ${money(owedAmount)} from ${owedBy.name}, charged when replaced.`}
+          {info.lifetime === 'final' &&
+            (totalMinutes > 0
+              ? `Lifetime ${formatMinutes(totalMinutes)} of printing: ${split} → ${money(owedAmount)} charged to ${owedBy.name}.`
+              : `No printing while installed: split 50/50 → ${money(owedAmount)} charged to ${owedBy.name}.`)}
+        </p>
+        <div className="flex items-center gap-2 flex-wrap">
+          {info.lifetime !== 'final' && (
+            <>
+              <input
+                type="date"
+                value={date}
+                onChange={(e) => setLifecycleDates({ ...lifecycleDates, [pt.id]: e.target.value })}
+                className="bg-slate-950 border border-slate-800 rounded p-1 text-[11px]"
+                aria-label={info.lifetime === 'spare' ? 'Installed on' : 'Replaced on'}
+              />
+              <button
+                onClick={() => (info.lifetime === 'spare' ? markInstalled(pt) : markReplaced(pt))}
+                className="text-[11px] font-semibold px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white"
+              >
+                {info.lifetime === 'spare' ? 'Installed' : 'Replaced'}
+              </button>
+            </>
+          )}
+          {info.lifetime !== 'spare' && (
+            <button onClick={() => undoLifecycle(pt)} className="text-[11px] text-slate-400 hover:text-slate-200 underline">
+              {info.lifetime === 'final' ? 'Undo replace' : 'Back to spare'}
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  };
 
   const deletePart = (part: Part) =>
     run(async () => {
@@ -1393,6 +1525,7 @@ export default function SpoolSplitApp() {
                             compact
                             onChange={(split) => updatePartSplit(pt, split)}
                           />
+                          {renderLifecycle(pt)}
                         </div>
                       ))}
                       {recSpools.length + recParts.length === 0 && (
@@ -1477,10 +1610,10 @@ export default function SpoolSplitApp() {
               <h3 className="text-sm font-semibold">Parts & Upkeep</h3>
             </div>
             <p className="text-xs text-slate-400">
-              By default, nozzles, tubes, plates and other parts are split by print time: each person pays their
-              share of the hours printed since the part was bought, until the next settle-up locks it. You can
-              change any item to 50/50, personal, or a custom %. All-time print
-              time:{' '}
+              Printer parts (nozzles, tubes, plates…) are pre-paid by whoever buys them. Tap Installed when one goes
+              in and Replaced when it comes out: its price is then split by each person's print time in between.
+              Other items are personal for the buyer by default. Any item can be changed to 50/50, personal or a
+              custom %. All-time print time:{' '}
               {users
                 .map((u) => `${u.name} ${formatMinutes(printTimeTotals[u.id] || 0)}`)
                 .join(' • ')}
@@ -1521,15 +1654,16 @@ export default function SpoolSplitApp() {
                           />
                         </div>
                       )}
-                      {users.length >= 2 && (
+                      {users.length >= 2 && split?.manual && (
                         <p className="text-xs text-slate-500 mt-0.5">
-                          {split?.manual ? 'Split:' : split?.frozen ? 'Split (locked at settle-up):' : 'Split so far:'}{' '}
+                          Split:{' '}
                           {users
                             .slice(0, 2)
                             .map((u) => `${u.name} ${Math.round((shares[u.id] || 0) * 100)}%`)
                             .join(' / ')}
                         </p>
                       )}
+                      {renderLifecycle(pt)}
                     </div>
                     <div className="flex items-center gap-3 shrink-0">
                       <span className="text-sm font-bold text-emerald-400">{money(Number(pt.price))}</span>
@@ -1698,6 +1832,33 @@ export default function SpoolSplitApp() {
             </div>
           </div>
 
+          {/* Pre-paid parts: not in the balance until they're replaced */}
+          {wallet.pendingParts.length > 0 && (
+            <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-2">
+              <h3 className="text-sm font-semibold flex items-center gap-2">
+                <Wrench className="w-4 h-4 text-emerald-400" /> Pre-paid parts (charged when replaced)
+              </h3>
+              {wallet.pendingParts.map((pp) => (
+                <div key={pp.part.id} className="flex items-start justify-between gap-3 text-xs">
+                  <span className="text-slate-300 min-w-0">
+                    {userName(pp.part.paid_by_user_id)}&apos;s {pp.part.name}{' '}
+                    <span className="text-slate-500">
+                      {pp.status === 'spare'
+                        ? '— spare, not installed'
+                        : `— installed since ${new Date(`${pp.sinceDate}T00:00:00`).toLocaleDateString()}, ${userName(
+                            pp.owedBy
+                          )}'s share so far ≈ ${money(pp.estimatedOwed)}`}
+                    </span>
+                  </span>
+                  <span className="font-semibold shrink-0">{money(Number(pp.part.price))}</span>
+                </div>
+              ))}
+              <p className="text-[11px] text-slate-500">
+                Mark parts Installed / Replaced under Purchases. Not included in the settle-up amount yet.
+              </p>
+            </div>
+          )}
+
           {/* 3. Full history, grouped by settle-up */}
           <div className="space-y-4">
             <h3 className="text-sm font-semibold">History</h3>
@@ -1829,7 +1990,13 @@ export default function SpoolSplitApp() {
                 <label className="text-xs text-slate-400">Who paid this bill?</label>
                 <select
                   value={receiptPaidBy}
-                  onChange={(e) => setReceiptPaidBy(e.target.value)}
+                  onChange={(e) => {
+                    const payer = e.target.value;
+                    setReceiptPaidBy(payer);
+                    setStagedParts((prev) =>
+                      prev.map((pt) => (pt.splitAuto ? { ...pt, split: defaultSplitFor(pt.category, payer) } : pt))
+                    );
+                  }}
                   className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2 text-sm mt-1"
                 >
                   {users.map((u) => (
@@ -1942,7 +2109,13 @@ export default function SpoolSplitApp() {
                     />
                     <select
                       value={pt.category}
-                      onChange={(e) => updateStagedPart(idx, { category: e.target.value as PartCategory })}
+                      onChange={(e) => {
+                        const category = e.target.value as PartCategory;
+                        updateStagedPart(idx, {
+                          category,
+                          ...(pt.splitAuto ? { split: defaultSplitFor(category, receiptPaidBy || activeUserId) } : {}),
+                        });
+                      }}
                       className="bg-slate-900 p-1.5 rounded min-w-0"
                     >
                       {PART_CATEGORIES.map((c) => (
@@ -1971,13 +2144,23 @@ export default function SpoolSplitApp() {
                   <SplitPicker
                     value={pt.split}
                     users={users}
-                    onChange={(split) => updateStagedPart(idx, { split })}
+                    onChange={(split) => updateStagedPart(idx, { split, splitAuto: false })}
                   />
+                  {pt.split.mode === 'default' && (
+                    <label className="flex items-center gap-1.5 text-[11px] text-slate-400">
+                      <input
+                        type="checkbox"
+                        checked={pt.installedNow}
+                        onChange={(e) => updateStagedPart(idx, { installedNow: e.target.checked })}
+                      />
+                      Installed now (starts its usage clock on the purchase date; leave off for spares)
+                    </label>
+                  )}
                   </div>
                 ))}
               </div>
               <button
-                onClick={() => setStagedParts([...stagedParts, newStagedPart()])}
+                onClick={() => setStagedParts([...stagedParts, newStagedPart(receiptPaidBy || activeUserId)])}
                 className="text-xs text-emerald-400 font-medium"
               >
                 + Add Part Row
