@@ -280,6 +280,8 @@ export default function SpoolSplitApp() {
   const [printSource, setPrintSource] = useState<'manual' | 'url' | 'screenshot'>('manual');
   const [printHint, setPrintHint] = useState<string | null>(null);
   const [usages, setUsages] = useState<UsageDraft[]>([]);
+  /** Set while the print form edits an existing print instead of logging a new one. */
+  const [editingPrintId, setEditingPrintId] = useState<string | null>(null);
 
   // Settlement Form State
   const [settleFrom, setSettleFrom] = useState('');
@@ -955,6 +957,70 @@ export default function SpoolSplitApp() {
   const updateUsage = (idx: number, patch: Partial<UsageDraft>) =>
     setUsages((prev) => prev.map((u, i) => (i === idx ? { ...u, ...patch } : u)));
 
+  /** Spools offered in the print form: active ones, plus archived ones the edited print already used. */
+  const printSpoolOptions = allSpools.filter(
+    (sp) => !sp.is_archived || usages.some((u) => u.spool_id === sp.id)
+  );
+
+  /** Live preview of what the print in the form costs and what it does to the balance. */
+  const printPreview = (() => {
+    const rows = usages.map((u) => {
+      const spool = allSpools.find((sp) => sp.id === u.spool_id);
+      const grams = Number(u.grams_used) || 0;
+      const cost = spool ? grams * Number(spool.cost_per_gram || 0) : 0;
+      return { spool, grams, cost };
+    });
+    let aOwesB = 0; // positive = users[0] owes users[1]
+    if (users.length >= 2) {
+      const [A, B] = [users[0].id, users[1].id];
+      const printer = printedBy || activeUserId;
+      for (const r of rows) {
+        const owner = r.spool?.paid_by_user_id;
+        if (owner !== A && owner !== B) continue;
+        const share = isSharedPrint ? r.cost / 2 : printer !== owner ? r.cost : 0;
+        aOwesB += owner === B ? share : -share;
+      }
+    }
+    return {
+      rows,
+      totalGrams: rows.reduce((sum, r) => sum + r.grams, 0),
+      totalCost: rows.reduce((sum, r) => sum + r.cost, 0),
+      aOwesB,
+    };
+  })();
+
+  const openNewPrint = () => {
+    if (editingPrintId) {
+      resetPrintForm();
+      setEditingPrintId(null);
+    }
+    if (usages.length === 0 && spools[0]) setUsages([{ spool_id: spools[0].id, grams_used: 25 }]);
+    setShowPrintModal(true);
+  };
+
+  const openEditPrint = (print: PrintJob) => {
+    const minutes = Math.max(0, Math.round(Number(print.duration_minutes || 0)));
+    setEditingPrintId(print.id);
+    setPrintTitle(print.title);
+    setPrintHint(null);
+    setPrintHours(minutes ? String(Math.floor(minutes / 60)) : '');
+    setPrintMins(minutes ? String(minutes % 60) : '');
+    setIsSharedPrint(print.is_shared_print);
+    if (print.printed_by_user_id) setPrintedBy(print.printed_by_user_id);
+    setPrintNoteOrUrl(print.source_url || '');
+    setPrintSource(print.source_type || 'manual');
+    setUsages((print.print_spool_usages || []).map((u) => ({ spool_id: u.spool_id, grams_used: Number(u.grams_used) })));
+    setShowPrintModal(true);
+  };
+
+  const closePrintModal = () => {
+    setShowPrintModal(false);
+    if (editingPrintId) {
+      resetPrintForm();
+      setEditingPrintId(null);
+    }
+  };
+
   const resetPrintForm = () => {
     setPrintTitle('');
     setPrintNoteOrUrl('');
@@ -973,7 +1039,7 @@ export default function SpoolSplitApp() {
       if (!(durationMinutes > 0)) throw new Error('Enter the print time (hours and minutes)');
       if (usages.length === 0) throw new Error('Add at least one filament slot');
       for (const u of usages) {
-        if (!spools.some((s) => s.id === u.spool_id)) throw new Error('Pick a spool for every slot');
+        if (!printSpoolOptions.some((s) => s.id === u.spool_id)) throw new Error('Pick a spool for every slot');
         if (!(Number(u.grams_used) > 0)) throw new Error('Grams used must be above 0 for every slot');
       }
 
@@ -994,6 +1060,45 @@ export default function SpoolSplitApp() {
 
       setSaving(true);
       try {
+        if (editingPrintId) {
+          const print = prints.find((x) => x.id === editingPrintId);
+          check(
+            await supabase
+              .from('prints')
+              .update({
+                title: printTitle.trim(),
+                printed_by_user_id: isSharedPrint ? null : printedBy || activeUserId,
+                is_shared_print: isSharedPrint,
+                duration_minutes: durationMinutes,
+                source_url: printNoteOrUrl || null,
+                total_grams: Number(totalGrams.toFixed(2)),
+                total_cost: Number(totalCost.toFixed(2)),
+              })
+              .eq('id', editingPrintId)
+          );
+          // Replace the filament rows with the edited ones (costs at today's spool prices)
+          check(await supabase.from('print_spool_usages').delete().eq('print_id', editingPrintId));
+          const ins = await supabase
+            .from('print_spool_usages')
+            .insert(preparedUsages.map((u) => ({ ...u, print_id: editingPrintId })));
+          if (ins.error) {
+            // Put the previous rows back so the print isn't left without filament
+            const old = (print?.print_spool_usages || []).map(({ spool_id, grams_used, calculated_cost }) => ({
+              spool_id,
+              grams_used,
+              calculated_cost,
+              print_id: editingPrintId,
+            }));
+            if (old.length) await supabase.from('print_spool_usages').insert(old);
+            throw new Error(ins.error.message);
+          }
+          resetPrintForm();
+          setEditingPrintId(null);
+          setShowPrintModal(false);
+          await fetchAllData();
+          return;
+        }
+
         const { data: newPrint } = check(
           await supabase
             .from('prints')
@@ -1231,12 +1336,7 @@ export default function SpoolSplitApp() {
 
       <div className="grid grid-cols-2 gap-3 mb-6">
         <button
-          onClick={() => {
-            if (usages.length === 0 && spools[0]) {
-              setUsages([{ spool_id: spools[0].id, grams_used: 25 }]);
-            }
-            setShowPrintModal(true);
-          }}
+          onClick={openNewPrint}
           className="flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold py-3.5 px-4 rounded-xl shadow-lg transition"
         >
           <Printer className="w-4 h-4" />
@@ -1310,6 +1410,13 @@ export default function SpoolSplitApp() {
                 </div>
                 <div className="flex items-center gap-3">
                   <span className="text-sm font-bold text-emerald-400">{money(Number(p.total_cost))}</span>
+                  <button
+                    onClick={() => openEditPrint(p)}
+                    className="text-slate-500 hover:text-emerald-400 p-1"
+                    title="Edit print"
+                  >
+                    <Pencil className="w-4 h-4" />
+                  </button>
                   <button
                     onClick={() => deletePrint(p)}
                     className="text-slate-500 hover:text-rose-400 p-1"
@@ -1913,6 +2020,15 @@ export default function SpoolSplitApp() {
                           >
                             {badge.text}
                           </span>
+                          {pr && (
+                            <button
+                              onClick={() => openEditPrint(pr)}
+                              className="text-slate-500 hover:text-emerald-400 p-1"
+                              title="Edit print"
+                            >
+                              <Pencil className="w-3.5 h-3.5" />
+                            </button>
+                          )}
                           {(st || pr) && (
                             <button
                               onClick={() => (st ? deleteSettlement(st) : deletePrint(pr!))}
@@ -2185,9 +2301,9 @@ export default function SpoolSplitApp() {
             <div className="flex justify-between items-center">
               <h2 className="text-base font-bold flex items-center gap-2">
                 <Printer className="w-4 h-4 text-emerald-400" />
-                Log a 3D Print Job
+                {editingPrintId ? 'Edit Print' : 'Log a 3D Print Job'}
               </h2>
-              <button onClick={() => setShowPrintModal(false)} className="text-slate-400 text-sm">
+              <button onClick={closePrintModal} className="text-slate-400 text-sm">
                 Close
               </button>
             </div>
@@ -2304,9 +2420,10 @@ export default function SpoolSplitApp() {
                     onChange={(e) => updateUsage(idx, { spool_id: e.target.value })}
                     className="flex-1 bg-slate-950 border border-slate-800 rounded-lg p-2 text-xs"
                   >
-                    {spools.map((s) => (
+                    {printSpoolOptions.map((s) => (
                       <option key={s.id} value={s.id}>
                         {s.color_name} ({s.material}) — paid by {userName(s.paid_by_user_id)}
+                        {s.is_archived ? ' (archived)' : ''}
                       </option>
                     ))}
                   </select>
@@ -2336,12 +2453,44 @@ export default function SpoolSplitApp() {
               </button>
             </div>
 
+            {/* Live cost preview */}
+            {usages.length > 0 && users.length >= 2 && (
+              <div className="bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs space-y-1.5">
+                <p className="font-semibold text-slate-300">Cost preview</p>
+                {printPreview.rows.map((r, i) => (
+                  <div key={i} className="flex justify-between gap-2 text-slate-400">
+                    <span className="truncate">
+                      {r.spool
+                        ? `${r.grams.toFixed(0)} g ${r.spool.color_name} (${r.spool.material}) × ${money(Number(r.spool.cost_per_gram || 0) * 1000)}/kg — ${userName(r.spool.paid_by_user_id)}'s`
+                        : 'Pick a spool'}
+                    </span>
+                    <span className="shrink-0">{money(r.cost)}</span>
+                  </div>
+                ))}
+                <div className="flex justify-between border-t border-slate-800 pt-1.5 font-semibold text-slate-200">
+                  <span>Total ({printPreview.totalGrams.toFixed(0)} g)</span>
+                  <span>{money(printPreview.totalCost)}</span>
+                </div>
+                <p className={Math.abs(printPreview.aOwesB) >= 0.005 ? 'text-amber-300' : 'text-slate-400'}>
+                  {Math.abs(printPreview.aOwesB) < 0.005
+                    ? 'Balance: no transfer — own filament.'
+                    : printPreview.aOwesB > 0
+                      ? `Balance: ${users[0].name} owes ${users[1].name} ${money(printPreview.aOwesB)} for this print.`
+                      : `Balance: ${users[1].name} owes ${users[0].name} ${money(-printPreview.aOwesB)} for this print.`}
+                  {editingPrintId ? ' (replaces what the print counted before)' : ''}
+                </p>
+                <p className="text-[11px] text-slate-500">
+                  The print time also counts toward installed parts, which are charged when they're replaced.
+                </p>
+              </div>
+            )}
+
             <button
               onClick={savePrintJob}
               disabled={saving}
               className="w-full bg-emerald-600 hover:bg-emerald-500 disabled:opacity-60 text-white font-semibold py-3 rounded-xl text-sm"
             >
-              Save Print
+              {editingPrintId ? 'Save Changes' : 'Save Print'}
             </button>
           </div>
         </div>
