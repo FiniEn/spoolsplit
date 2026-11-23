@@ -2,7 +2,7 @@
 
 A small web app for two people sharing a Bambu Lab 3D printer. It tracks what each person spent on filament and used in prints, and keeps a running balance of who owes whom.
 
-- **Purchases:** add spools and parts by hand, or upload a receipt and Claude fills them in. Tax and shipping are spread across every item, and parts (nozzles, hotends, PTFE tubes, build plates, AMS parts, maintenance) go in their own list.
+- **Purchases:** add spools and parts by hand, or upload a receipt and Gemini fills them in. Tax and shipping are spread across every item, and parts (nozzles, hotends, PTFE tubes, build plates, AMS parts, maintenance) go in their own list.
 - **Prints:** log a print by hand, or upload a Bambu Handy / Studio screenshot or paste a MakerWorld link, and the name, print time and grams fill in. Each print's cost is worked out from the grams used and the spool's price per gram.
 - **Parts split by print time:** each part's price is shared in proportion to the hours each person printed since it was bought. Shared prints count half each, and the split is 50/50 until someone prints.
 - **Wallet model:** whoever buys a spool or part pays from their own wallet. You owe the other person only for what you use of *their* purchases. Using your own costs nothing, and shared prints split half each. Everything nets out to **at most one payment** between you.
@@ -14,12 +14,12 @@ A small web app for two people sharing a Bambu Lab 3D printer. It tracks what ea
 ## Setup
 
 1. Create a Supabase project and run `supabase/schema.sql` in its SQL editor. Then run `supabase/add-receipts.sql`, which adds receipts, per-item splits and the private `receipts` storage bucket for the files. If your database was set up before parts existed, run `supabase/add-parts.sql` first. This creates the tables and the two users; edit the names in the last statement.
-2. Copy `.env.example` to `.env.local` and fill in your Supabase URL, anon key, Anthropic API key (`ANTHROPIC_API_KEY`) and `WORKSPACE_PIN`.
+2. Copy `.env.example` to `.env.local` and fill in your Supabase URL, anon key, and Gemini API key.
 3. Run `npm install`, then `npm run dev`.
 
 ## Security
 
-- **PIN lock:** the whole app is locked behind `WORKSPACE_PIN`. That covers the pages, the app's JavaScript (which contains the Supabase key) and the AI routes. It is checked on the server, so the app won't open without it.
+- **PIN lock:** the whole app is locked behind `WORKSPACE_PIN`. That covers the pages, the app's JavaScript (which contains the Supabase key) and the Gemini routes. It is checked on the server, so the app won't open without it.
 - **Staying unlocked:** a correct PIN keeps that device unlocked for 180 days. The 🔒 button locks it again, and changing `WORKSPACE_PIN` locks every device.
 - **Wrong PINs:** each wrong PIN takes a second to answer, and 5 wrong tries lock that IP address out for 15 minutes. Use 6 or more digits.
 - **Known limit:** the database rules still allow anyone who has the Supabase anon key. The key is now only delivered after the PIN, but anyone who unlocks the app can see it. For per-person access, add Supabase Auth and tighten the policies in `supabase/schema.sql`.

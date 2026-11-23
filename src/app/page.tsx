@@ -961,7 +961,7 @@ export default function SpoolSplitApp() {
         </button>
         <button
           onClick={() => {
-            setStagedSpools([]);
+            setStagedSpools([newStagedSpool({ color_name: 'Jade White', color_hex: '#ffffff' })]);
             setStagedParts([]);
             setReceiptDate(todayIso());
             setReceiptVendor('');
@@ -1534,7 +1534,7 @@ export default function SpoolSplitApp() {
               </div>
               {aiLoading && (
                 <p className="text-xs text-emerald-400 mt-2 flex items-center justify-center gap-1">
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" /> Claude is reading the receipt...
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" /> Gemini is reading the receipt...
                 </p>
               )}
             </div>

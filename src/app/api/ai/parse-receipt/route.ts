@@ -1,51 +1,16 @@
 import { NextResponse } from 'next/server';
-import { z } from 'zod';
+import { GoogleGenAI, Type } from '@google/genai';
 import { supabase } from '@/lib/supabase';
-import { ExtractionError, extractWithClaude } from '@/lib/claude';
 
-// Long receipts / PDFs can take Claude a while; allow up to a minute on Vercel.
-export const maxDuration = 60;
-
-/** Files bigger than this are rejected before being sent to Claude. */
+/** Files bigger than this are rejected before being sent to Gemini (its inline limit is ~20 MB). */
 const MAX_FILE_BYTES = 15 * 1024 * 1024;
-
-const ReceiptSchema = z.object({
-  vendor: z.string(),
-  order_date: z.string(),
-  grand_total: z.number(),
-  spools: z.array(
-    z.object({
-      brand: z.string(),
-      material: z.string(),
-      color_name: z.string(),
-      estimated_color_hex: z.string(),
-      weight_grams: z.number(),
-      quantity: z.number().int(),
-      unit_landed_cost: z.number(),
-    })
-  ),
-  parts: z.array(
-    z.object({
-      name: z.string(),
-      category: z.enum(['nozzle', 'hotend', 'ptfe_tube', 'build_plate', 'ams_part', 'maintenance', 'other']),
-      quantity: z.number().int(),
-      unit_landed_cost: z.number(),
-    })
-  ),
-});
-
-const INSTRUCTIONS = `You are an expert 3D printing invoice parser. Extract every item from this receipt into two lists:
-- 'spools': filament spools/refills.
-- 'parts': EVERY other item on the receipt, one entry per product line — printer parts (nozzles, hotends, PTFE tubes, build plates, AMS parts), maintenance items (lubricant, cleaning, desiccant), and anything else (tools, magnets, glue, accessories, personal items). Use category 'other' for anything that isn't a printer part or maintenance item. Do NOT list tax, shipping, discounts or gift cards as items.
-Proportionally distribute any tax, shipping, and discounts across ALL items (spools and parts) so 'unit_landed_cost' reflects the true out-of-pocket cost of ONE unit.
-If a line item has quantity > 1, return the 'unit_landed_cost' for ONE unit and set 'quantity' accordingly.
-For spools, estimate a 6-character hex code (e.g. #FFFFFF) for 'estimated_color_hex' based on the filament color name, and use 1000 for 'weight_grams' if the weight isn't shown.
-'vendor' = the store name. 'order_date' = the order or invoice date as YYYY-MM-DD, or an empty string if not shown. 'grand_total' = the total charged, or 0 if not shown.
-Either list may be empty.`;
 
 export async function POST(request: Request) {
   try {
     const { fileBase64: inlineBase64, mimeType, rawText, storagePath } = await request.json();
+    if (!process.env.GEMINI_API_KEY) {
+      return NextResponse.json({ error: 'GEMINI_API_KEY is not configured on the server' }, { status: 500 });
+    }
     let fileBase64: string | undefined = inlineBase64;
     // Large files are uploaded to Supabase Storage by the browser first (Vercel caps request
     // bodies at 4.5 MB); fetch them from there.
@@ -71,17 +36,108 @@ export async function POST(request: Request) {
     if (fileBase64 && fileBase64.length > (MAX_FILE_BYTES * 4) / 3) {
       return NextResponse.json({ error: 'File is too large (max 15 MB)' }, { status: 413 });
     }
+    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-    const data = await extractWithClaude({
-      schema: ReceiptSchema,
-      fileBase64,
-      mimeType,
-      extraText: rawText ? `Order text:\n${rawText}` : undefined,
-      instructions: INSTRUCTIONS,
+    const parts: any[] = [
+      {
+        text: `You are an expert 3D printing invoice parser. Extract every item from this receipt into two lists:
+        - 'spools': filament spools/refills.
+        - 'parts': EVERY other item on the receipt, one entry per product line — printer parts (nozzles, hotends, PTFE tubes, build plates, AMS parts), maintenance items (lubricant, cleaning, desiccant), and anything else (tools, magnets, glue, accessories, personal items). Use category 'other' for anything that isn't a printer part or maintenance item. Do NOT list tax, shipping, discounts or gift cards as items.
+        Proportionally distribute any tax, shipping, and discounts across ALL items (spools and parts) so 'unit_landed_cost' reflects the true out-of-pocket cost of ONE unit.
+        If a line item has quantity > 1, return the 'unit_landed_cost' for ONE unit and set 'quantity' accordingly.
+        For spools, estimate a 6-character hex code (e.g. #FFFFFF) for 'estimated_color_hex' based on the filament color name.
+        Either list may be empty.`,
+      },
+    ];
+
+    if (fileBase64 && mimeType) {
+      parts.push({
+        inlineData: {
+          data: fileBase64,
+          mimeType,
+        },
+      });
+    }
+    if (rawText) {
+      parts.push({ text: `Order text:\n${rawText}` });
+    }
+
+    const response = await ai.models.generateContent({
+      model: process.env.GEMINI_MODEL || 'gemini-3.8-flash',
+      contents: [{ role: 'user', parts }],
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            vendor: { type: Type.STRING },
+            order_date: { type: Type.STRING, description: 'Order/invoice date as YYYY-MM-DD, empty if not shown' },
+            grand_total: { type: Type.NUMBER },
+            spools: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  brand: { type: Type.STRING },
+                  material: { type: Type.STRING },
+                  color_name: { type: Type.STRING },
+                  estimated_color_hex: { type: Type.STRING },
+                  weight_grams: { type: Type.NUMBER },
+                  quantity: { type: Type.INTEGER },
+                  unit_landed_cost: { type: Type.NUMBER },
+                },
+                required: [
+                  'brand',
+                  'material',
+                  'color_name',
+                  'estimated_color_hex',
+                  'weight_grams',
+                  'quantity',
+                  'unit_landed_cost',
+                ],
+              },
+            },
+            parts: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  name: { type: Type.STRING },
+                  category: {
+                    type: Type.STRING,
+                    enum: ['nozzle', 'hotend', 'ptfe_tube', 'build_plate', 'ams_part', 'maintenance', 'other'],
+                  },
+                  quantity: { type: Type.INTEGER },
+                  unit_landed_cost: { type: Type.NUMBER },
+                },
+                required: ['name', 'category', 'quantity', 'unit_landed_cost'],
+              },
+            },
+          },
+          required: ['vendor', 'spools', 'parts', 'grand_total'],
+        },
+      },
     });
+
+    const data = JSON.parse(response.text || '{}');
     return NextResponse.json(data);
   } catch (err: any) {
-    const status = err instanceof ExtractionError ? err.status : 500;
-    return NextResponse.json({ error: err?.message || 'Failed to parse receipt' }, { status });
+    return NextResponse.json(
+      { error: readableError(err) || 'Failed to parse receipt' },
+      { status: 500 }
+    );
   }
+}
+
+/** Gemini errors arrive as a JSON string; pull out the human-readable message. */
+function readableError(err: any): string {
+  const raw = String(err?.message || '');
+  try {
+    const parsed = JSON.parse(raw);
+    const msg = parsed?.error?.message || parsed?.message;
+    if (msg) return `Gemini: ${msg}`;
+  } catch {
+    // not JSON
+  }
+  return raw;
 }
